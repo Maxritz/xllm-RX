@@ -1,0 +1,868 @@
+/* Copyright 2025-2026 The xLLM Authors.
+Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "llm_engine.h"
+
+#include <absl/strings/str_format.h>
+#include <absl/time/clock.h>
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+
+#include <algorithm>
+#include <boost/algorithm/string.hpp>
+#include <chrono>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <memory>
+#include <optional>
+#include <utility>
+
+#include "common/device_monitor.h"
+#include "common/metrics.h"
+#include "common/options.h"
+#include "core/common/global_flags.h"
+#include "core/distributed_runtime/distributed_virtual_memory_coordinator.h"
+#include "core/distributed_runtime/kv_cache_capacity_planner.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/config/parallel_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/service_config.h"
+#include "core/framework/config/speculative_config.h"
+#include "core/framework/eplb/eplb_controller.h"
+#include "core/framework/model_loader/model_loader.h"
+#include "core/framework/speculative/adaptive/draft_step_controller.h"
+#include "core/framework/speculative/draft_config.h"
+#include "core/kv_cache/block/block_utils.h"
+#include "core/kv_cache/layout/kv_cache_shape.h"
+#include "core/kv_cache/prefix/block_hasher.h"
+#include "core/kv_cache/storage/kv_cache_utils.h"
+#include "core/platform/platform.h"
+#include "framework/block/kv_cache_manager_factory.h"
+#include "framework/model/model_args.h"
+#include "framework/speculative/mtp_utils.h"
+#include "models/model_registry.h"
+#include "runtime/decode_graph_bucket.h"
+#include "runtime/llm_worker_impl.h"
+#include "runtime/worker.h"
+#include "server/xllm_server_registry.h"
+#include "util/env_var.h"
+#include "util/pretty_print.h"
+#include "util/tensor_helper.h"
+#include "util/utils.h"
+
+namespace xllm {
+namespace {
+
+bool contains_graph_warmup(const BatchGroup& batches) {
+  for (const Batch& batch : batches) {
+    const std::vector<Sequence*> sequences = batch.get_sequences();
+    if (std::any_of(sequences.begin(), sequences.end(), [](Sequence* sequence) {
+          return sequence != nullptr && sequence->is_graph_warmup();
+        })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+LLMEngine::LLMEngine(
+    const runtime::Options& options,
+    std::shared_ptr<DistributedWorkerManager> distributed_worker_manager)
+    : options_(options),
+      distributed_worker_manager_(std::move(distributed_worker_manager)) {
+  CHECK(!KVCacheConfig::get_instance().enable_vmm_kvcache() ||
+        options_.host_blocks_factor() <= 1.0)
+      << "Virtual memory does not support host KV cache offload; set "
+         "--host_blocks_factor=0.";
+  auto master_node_addr = options.master_node_addr().value_or("");
+  CHECK(!master_node_addr.empty())
+      << " LLM need to set master node addr, Please set --master_node_addr.";
+  const auto& devices = options_.devices();
+  // initialize device monitor
+  DeviceMonitor::get_instance().initialize(devices);
+  CHECK_GT(devices.size(), 0) << "At least one device is required";
+
+  CHECK(!devices[0].is_cpu()) << "CPU device is not supported";
+  const auto device_type = devices[0].type();
+  for (const auto device : devices) {
+    CHECK_EQ(device.type(), device_type)
+        << "All devices should be the same type";
+#if defined(USE_NPU)
+    FLAGS_enable_atb_comm_multiprocess =
+        options.enable_offline_inference() || (options.nnodes() > 1);
+#endif
+  }
+
+  // setup all workers and create worker clients in nnode_rank=0 engine side.
+  setup_workers(options);
+
+  dp_size_ = options_.dp_size();
+  const uint32_t cp_size = options_.cp_size();
+  forward_input_factory_ =
+      std::make_unique<ForwardInputFactory>(ForwardInputFactoryOptions{
+          .dp_size = dp_size_,
+          .cp_size = cp_size,
+          .max_tokens_per_batch =
+              static_cast<int64_t>(options_.max_tokens_per_batch()),
+          .enable_dp_global_json_object_active =
+              dp_size_ > 1 && !options_.is_draft_engine() &&
+              options_.num_speculative_tokens() > 0,
+      });
+  worker_clients_num_ = worker_clients_.size();
+  dp_local_size_ = worker_clients_num_ / dp_size_;
+  // MLU and NPU model-side CP both use orthogonal CP x attention-TP, so the
+  // DP-local TP width is divided by CP.
+  dp_local_tp_size_ = dp_local_size_ / cp_size;
+  if (dp_size_ > 1 && options_.enable_adaptive_target_verify() &&
+      SpeculativeConfig::is_dspark_algorithm(
+          options_.speculative_algorithm()) &&
+      !options_.is_draft_engine()) {
+    dspark_dp_coordinator_ = std::make_unique<DSparkDpCoordinator>(
+        options_.num_speculative_tokens());
+  }
+
+  process_group_test();
+  if (options_.enable_adaptive_draft_step() && !options_.is_draft_engine()) {
+    CHECK(options_.enable_task_pipeline() && options_.dp_size() == 1 &&
+          options_.cp_size() == 1 && options_.num_speculative_tokens() > 0 &&
+          options_.num_speculative_tokens() <= 64);
+    draft_step_controller_ = std::make_unique<DraftStepController>(
+        options_.adaptive_draft_step_config(),
+        static_cast<uint32_t>(options_.num_speculative_tokens()));
+  }
+}
+
+LLMEngine::~LLMEngine() = default;
+
+void LLMEngine::process_group_test() {
+#if !defined(USE_NPU)
+  // In multi-node serving mode, only driver engine
+  // create worker_clients_.
+  if (worker_clients_num_ > 1) {
+    // test process group
+    std::vector<folly::SemiFuture<folly::Unit>> futures;
+    futures.reserve(worker_clients_num_);
+    for (auto& worker : worker_clients_) {
+      futures.emplace_back(worker->process_group_test_async());
+    }
+    // Wait for all futures to complete with a configurable timeout.
+    // The timeout can be adjusted via the
+    // XLLM_PROCESS_GROUP_ASYNC_TIMEOUT_SECONDS environment variable (default: 4
+    // seconds). This is particularly important in multi-node multi-device
+    // scenarios where network latency may require a longer timeout period.
+    const int timeout_seconds = util::get_process_group_test_timeout_seconds();
+    folly::collectAll(futures)
+        .within(std::chrono::seconds(timeout_seconds))
+        .get();
+  }
+#endif
+}
+
+bool LLMEngine::init(MasterStatus master_status) {
+  return init(master_status, /*prepare_model=*/{});
+}
+
+bool LLMEngine::init(
+    MasterStatus master_status,
+    const ModelInitCallback& prepare_model,
+    std::shared_ptr<KVCacheTransferCoordinatorBase> transfer_coordinator) {
+  if (!init_model(master_status, prepare_model)) {
+    LOG(ERROR) << "Failed to init model from: " << options_.model_path();
+    return false;
+  }
+
+  eplb_controller_ = EplbController::create(
+      args_, static_cast<int32_t>(worker_clients_num_), options_.ep_size());
+  forward_input_factory_->set_eplb_controller(eplb_controller_.get());
+
+  auto kv_cache_cap = estimate_kv_cache_capacity();
+
+  if (!allocate_kv_cache(kv_cache_cap, std::move(transfer_coordinator))) {
+    LOG(ERROR) << "Failed to initialize kv cache";
+    return false;
+  } else {
+    LOG(INFO) << "Successfully initialized kv cache";
+  }
+
+  return true;
+}
+
+bool LLMEngine::init_model(MasterStatus master_status,
+                           const ModelInitCallback& prepare_model) {
+  const std::string& model_path = options_.model_path();
+  auto model_loader = ModelLoader::create(model_path);
+  LOG(INFO) << "Initializing model from: " << model_path;
+
+  args_ = model_loader->model_args();
+  ModelRegistry::configure_mtp_args(
+      args_,
+      options_.speculative_algorithm(),
+      options_.is_draft_engine(),
+      ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl()));
+  if (!options_.is_draft_engine() &&
+      SpeculativeConfig::is_block_diffusion_algorithm(
+          options_.speculative_algorithm())) {
+    CHECK(options_.draft_model_path().has_value())
+        << "Block-diffusion Target requires a draft checkpoint.";
+    // Scheduler warmup must use the same auxiliary-state width as the workers.
+    args_.layers_to_capture(
+        read_capture_layer_ids(options_.draft_model_path().value()));
+  }
+
+#if defined(USE_NPU)
+  if (options_.enable_speculative_decode() &&
+      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm()) &&
+      uses_mtp_target_spec_width(args_.model_type())) {
+    args_.num_speculative_tokens(options_.num_speculative_tokens());
+  }
+#endif
+
+  // A draft engine is fed token ids and detokenized by the target, so it
+  // shares the target vocabulary and loads no tokenizer of its own.
+  if (!options_.is_draft_engine()) {
+    tokenizer_ = model_loader->tokenizer();
+    CHECK(tokenizer_ != nullptr);
+    tokenizer_args_ = model_loader->tokenizer_args();
+  }
+
+  dtype_ = util::parse_dtype(args_.dtype(), options_.devices()[0]);
+  LOG(INFO) << "Block info, block_size: " << options_.block_size()
+            << ", n_layers: " << args_.n_layers() << ", dtype: " << dtype_
+            << ", kv_cache_dtype: " << options_.kv_cache_dtype();
+
+  if (tokenizer_ != nullptr) {
+    const int64_t tokenizer_vocab_size = tokenizer_->vocab_size();
+    int64_t model_vocab_size = args_.vocab_size();
+    if (tokenizer_vocab_size != model_vocab_size) {
+      // use tokenizer vocab size if model vocab size is not set
+      if (model_vocab_size <= 0) {
+        LOG(WARNING) << "Model vocab size is not set, using tokenizer vocab "
+                        "size: "
+                     << tokenizer_vocab_size;
+        args_.vocab_size(tokenizer_vocab_size);
+      } else if (tokenizer_vocab_size > model_vocab_size) {
+        LOG(WARNING) << "Unsafe vocab mismatch: tokenizer: "
+                     << tokenizer_vocab_size << ", model: " << model_vocab_size;
+      } else {
+        LOG(INFO) << "Tokenizer/model vocab differ: tokenizer="
+                  << tokenizer_vocab_size << ", model=" << model_vocab_size;
+      }
+    }
+  }
+
+  LOG(INFO) << "Initializing model with " << args_;
+  LOG(INFO) << "Initializing model with quant args: "
+            << model_loader->quant_args();
+  LOG(INFO) << "Initializing model with tokenizer args: " << tokenizer_args_;
+  LOG(INFO) << "Initializing model with random seed: "
+            << ::xllm::ExecutionConfig::get_instance().random_seed();
+
+  if (prepare_model && !prepare_model(*model_loader,
+                                      args_.n_layers(),
+                                      static_cast<int32_t>(dp_size_),
+                                      static_cast<int32_t>(dp_local_tp_size_),
+                                      master_status)) {
+    return false;
+  }
+
+  if (LoadConfig::get_instance().enable_vmm_weights() &&
+      !KVCacheConfig::get_instance().enable_vmm_kvcache() &&
+      master_status != MasterStatus::WAKEUP) {
+    // Sleeping weights have no device allocation yet. Keep ordinary KV
+    // tensors from consuming the page budget needed by the first wakeup.
+    const size_t weight_pages =
+        DistributedVirtualMemoryCoordinator::get_instance()
+            .get_weight_page_count(options_.model_id());
+    initial_weight_reservation_bytes_ =
+        weight_pages *
+        KVCacheConfig::get_instance().phy_page_granularity_size();
+  }
+
+  // init model for each worker in parallel
+  // multiple workers, call async init
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(worker_clients_num_);
+  for (auto& worker : worker_clients_) {
+    futures.push_back(worker->init_model_async(
+        model_path,
+        ::xllm::ExecutionConfig::get_instance().random_seed(),
+        master_status));
+  }
+  // wait for all futures to complete
+  auto results = folly::collectAll(futures).get();
+  for (const auto& result : results) {
+    if (!result.value()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+KVCacheCapacity LLMEngine::estimate_kv_cache_capacity(
+    bool initialize_virtual_memory) {
+  return KVCacheCapacityPlanner(args_,
+                                options_,
+                                dtype_,
+                                dp_local_tp_size_,
+                                worker_clients_,
+                                /*is_multimodal=*/false,
+                                initial_weight_reservation_bytes_)
+      .plan(initialize_virtual_memory);
+}
+
+bool LLMEngine::allocate_kv_cache(
+    const KVCacheCapacity& kv_cache_cap,
+    std::shared_ptr<KVCacheTransferCoordinatorBase> transfer_coordinator,
+    const VmmKVCacheLayout* shared_vmm_layout) {
+  const KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
+
+  const bool enable_state_cache = has_linear_attention_layers(args_) ||
+                                  kv_cache_cap.kpool_tail_slot_size() > 0;
+
+  LOG(INFO) << "kv cache capacity: "
+            << readable_size(kv_cache_cap.cache_size_in_bytes())
+            << ", blocks: " << kv_cache_cap.n_blocks()
+            << ", slot_size: " << kv_cache_cap.slot_size()
+            << ", index_slot_size: " << kv_cache_cap.index_slot_size()
+            << ", indexer_layers: " << kv_cache_cap.num_indexer_layers()
+            << ", scale_slot_size: " << kv_cache_cap.scale_slot_size()
+            << ", linear_slot_size: " << kv_cache_cap.linear_slot_size()
+            << ", linear_blocks: " << kv_cache_cap.num_linear_state_blocks()
+            << ", state_slots: "
+            << (enable_state_cache ? kv_cache_cap.num_linear_state_blocks() : 0)
+            << ", gdn_state_bytes: "
+            << readable_size(kv_cache_cap.num_linear_attention_layers() *
+                             kv_cache_cap.linear_slot_size())
+            << ", kpool_state_bytes: "
+            << readable_size(kv_cache_cap.num_indexer_layers() *
+                             kv_cache_cap.kpool_tail_slot_size())
+            << ", max_linear_state_cache_slots: "
+            << options_.max_linear_state_cache_slots()
+            << ", reserved_state_bytes: "
+            << readable_size(kv_cache_cap.linear_cache_size_in_bytes())
+            << ", n_layers: " << kv_cache_cap.n_layers()
+            << ", kv_cache_dtype: " << options_.kv_cache_dtype();
+
+  CHECK_GT(kv_cache_cap.n_blocks(), 0) << "no memory for kv cache";
+  const int32_t block_size = static_cast<int32_t>(kv_cache_cap.block_size());
+
+  // Validate host offload before constructing block managers or asking workers
+  // to allocate potentially large pinned host tensors. The factory fills the
+  // shape-dependent validation fields.
+  HostCacheValidationOptions host_cache_validation_options{
+      .host_blocks_factor = options_.host_blocks_factor(),
+      .device_block_count = kv_cache_cap.n_blocks(),
+      .supports_host_kv_offload = Platform::supports_host_kv_offload(),
+      .enable_prefix_cache = options_.enable_prefix_cache(),
+      .enable_disagg_pd = options_.enable_disagg_pd(),
+      .enable_kvcache_store = options_.enable_kvcache_store(),
+      .instance_role = options_.instance_role(),
+      .supports_grouped_cache_offload =
+          util::is_deepseek_v4_model_type(args_.model_type()),
+      .kv_cache_dtype = options_.kv_cache_dtype(),
+      .indexer_cache_dtype = kv_cache_config.indexer_cache_dtype(),
+      .model_type = args_.model_type(),
+  };
+  // DECODE-side skips LINEAR prefix cache by role (see
+  // composite_block_manager.cpp::leaf_participates_in_prefix_cache), so the
+  // chunked-prefill + chunk-stride guards below are only meaningful for
+  // PREFILL / MIX. On DECODE the linear-state cache is disabled anyway and
+  // pd_launch.sh legitimately sets --enable_chunked_prefill=false.
+  const bool is_decode = options_.instance_role() == InstanceRole::DECODE;
+  if (options_.enable_prefix_cache() && enable_state_cache && !is_decode) {
+    const auto& scheduler_config = ::xllm::SchedulerConfig::get_instance();
+    CHECK(scheduler_config.enable_chunked_prefill())
+        << "GDN/KPool state prefix cache requires block-aligned chunked "
+           "prefill to save matching linear states. Please set "
+           "--enable_chunked_prefill=true in your config.";
+    CHECK(scheduler_config.max_tokens_per_chunk_for_prefill() % block_size == 0)
+        << "state-cache prefix cache saves checkpoints at "
+           "chunk-end boundaries, so max_tokens_per_chunk_for_prefill ("
+        << scheduler_config.max_tokens_per_chunk_for_prefill()
+        << ") must be a multiple of block_size (" << block_size << ").";
+  }
+
+  // initialize block manager
+  // Logical block_size *= kv_split_size.
+  const int32_t kv_split_size_eff =
+      ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
+  BlockManagerPool::Options options;
+  options.num_blocks(kv_cache_cap.n_blocks())
+      .kv_events_config(options_.is_draft_engine()
+                            ? std::string()
+                            : kv_cache_config.kv_events_config())
+      .hasher_type(mtp_hasher_type(BlockHasherType::TEXT,
+                                   options_.num_speculative_tokens(),
+                                   options_.speculative_algorithm()))
+      .block_size(kv_split_size_eff > 1 ? block_size * kv_split_size_eff
+                                        : block_size)
+      .host_num_blocks(kv_cache_cap.n_blocks() * options_.host_blocks_factor())
+      .enable_linear_state(enable_state_cache)
+      .enable_prefix_cache(options_.enable_prefix_cache())
+      .enable_disagg_pd(options_.enable_disagg_pd())
+      .enable_kvcache_store(options_.enable_kvcache_store())
+      .prefetch_batch_size(options_.prefetch_batch_size())
+      .enable_vmm_kvcache(kv_cache_config.enable_vmm_kvcache())
+      .num_layers(args_.n_layers())
+      .slot_size(kv_cache_cap.slot_size())
+      .model_id(options_.model_id())
+      .max_seqs_per_batch(options_.max_seqs_per_batch())
+      .num_speculative_tokens(options_.num_speculative_tokens())
+      // DECODE-side prefix cache participation is per-leaf and gated by the
+      // predicate in composite_block_manager.cpp. P and MIX are treated
+      // identically (both admit prefix cache on every leaf).
+      .instance_is_decode(options_.instance_role() == InstanceRole::DECODE);
+  if (enable_state_cache) {
+    // The unified state slot pool spans all physical slots [0, N); it can
+    // contain GDN state and KPool tail state.
+    options.linear_state_num_slots(
+        static_cast<int32_t>(kv_cache_cap.num_linear_state_blocks()));
+  }
+  if (util::is_deepseek_v4_model_type(args_.model_type())) {
+    constexpr uint32_t kManagerTypeBlockManagerImpl = 0;
+    constexpr uint32_t kManagerTypeSlidingWindowBlockManager = 1;
+
+    std::vector<uint32_t> manager_types{kManagerTypeSlidingWindowBlockManager};
+    std::vector<uint32_t> manager_compress_ratios{
+        0};  // unused for sliding window manager
+    std::vector<uint32_t> token_manager_ratios;
+    token_manager_ratios.reserve(2);
+    for (const int32_t ratio : args_.compress_ratios()) {
+      if (ratio == 4 || ratio == 128) {
+        const uint32_t ratio_u32 = static_cast<uint32_t>(ratio);
+        if (std::find(token_manager_ratios.begin(),
+                      token_manager_ratios.end(),
+                      ratio_u32) == token_manager_ratios.end()) {
+          token_manager_ratios.push_back(ratio_u32);
+        }
+      }
+    }
+    for (const uint32_t ratio : token_manager_ratios) {
+      manager_types.push_back(kManagerTypeBlockManagerImpl);
+      manager_compress_ratios.push_back(ratio);
+    }
+
+    const int64_t semantic_window = std::max(args_.window_size(), 1);
+    const int64_t max_model_len = args_.max_seq_len();
+    const int64_t effective_window =
+        max_model_len > 0 ? std::min<int64_t>(semantic_window, max_model_len)
+                          : semantic_window;
+    const uint32_t swa_blocks_per_seq = static_cast<uint32_t>(
+        get_swa_blocks_per_seq(effective_window, block_size));
+    CHECK_LE(kv_cache_cap.swa_count(),
+             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
+        << "DSV4 swa_count exceeds uint32_t range: "
+        << kv_cache_cap.swa_count();
+
+    options.sliding_window_size(static_cast<uint32_t>(effective_window))
+        .swa_blocks_per_seq(swa_blocks_per_seq)
+        .swa_num_blocks(static_cast<uint32_t>(kv_cache_cap.swa_count()))
+        .max_tokens_per_batch(options_.max_tokens_per_batch())
+        .manager_types(std::move(manager_types))
+        .compress_ratios(std::move(manager_compress_ratios));
+  }
+
+  if (options_.enable_kvcache_store()) {
+    CHECK_GT(options_.host_blocks_factor(), 1.0)
+        << "KV cache Store requires Host cache blocks.";
+  }
+
+  const bool is_mtp_draft_engine =
+      options_.is_draft_engine() &&
+      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm());
+  if (is_mtp_draft_engine) {
+    // The speculative scheduler owns only the target engine BlockManager.
+    // Keep the draft engine's placeholder manager non-caching so a Draft
+    // model with only SWA tensors does not pretend to own logical prefixes.
+    options.enable_prefix_cache(false).enable_vmm_kvcache(false);
+  }
+
+  if (options_.host_blocks_factor() > 1.0 && !is_mtp_draft_engine) {
+    // Translate a composite cache capacity into typed Host pools. The
+    // hierarchy layer consumes only this BlockType map and does not need to
+    // identify the model that produced the layout.
+    if (!options.manager_types().empty()) {
+      std::map<BlockType, uint32_t> host_capacities;
+      if (kv_cache_cap.swa_count() > 0) {
+        host_capacities.emplace(
+            BlockType::SWA,
+            static_cast<uint32_t>(scale_host_block_count(
+                kv_cache_cap.swa_count(), options_.host_blocks_factor())));
+      }
+      if (kv_cache_cap.c4_count() > 0) {
+        host_capacities.emplace(
+            BlockType::C4,
+            static_cast<uint32_t>(scale_host_block_count(
+                kv_cache_cap.c4_count(), options_.host_blocks_factor())));
+      }
+      if (kv_cache_cap.c128_count() > 0) {
+        host_capacities.emplace(
+            BlockType::C128,
+            static_cast<uint32_t>(scale_host_block_count(
+                kv_cache_cap.c128_count(), options_.host_blocks_factor())));
+      }
+      options.host_num_blocks_by_type(std::move(host_capacities));
+    }
+    options.enable_host_offload(true);
+  }
+
+  auto factory_result =
+      KVCacheManagerFactory::create(kv_cache_cap,
+                                    args_,
+                                    dp_local_tp_size_,
+                                    dtype_,
+                                    std::move(options),
+                                    std::move(transfer_coordinator),
+                                    dp_size_,
+                                    std::move(host_cache_validation_options),
+                                    shared_vmm_layout);
+  factory_result.shape.print_shapes();
+  KVCacheShape kv_cache_shape = std::move(factory_result.shape);
+  kv_cache_manager_ = std::move(factory_result.manager);
+
+  // init kv cache for each worker in parallel
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(worker_clients_num_);
+  if (options_.instance_role() == InstanceRole::DEFAULT) {
+    for (auto& worker : worker_clients_) {
+      futures.push_back(worker->allocate_kv_cache_async(kv_cache_shape));
+    }
+  } else {
+    for (auto& worker : worker_clients_) {
+      futures.push_back(
+          worker->allocate_kv_cache_with_transfer_async(kv_cache_shape));
+    }
+  }
+  // wait for all futures to complete
+  auto results = folly::collectAll(futures).get();
+  for (const auto& result : results) {
+    if (!result.value()) {
+      return false;
+    }
+  }
+  // VirtualMemory mode: reserve padding blocks and start prealloc thread.
+  kv_cache_manager_->reserve_virtual_memory_padding_blocks();
+
+  return true;
+}
+
+void LLMEngine::select_draft_steps(std::vector<LlmForwardInput>& inputs) {
+  if (!draft_step_controller_) {
+    return;
+  }
+  CHECK_EQ(inputs.size(), 1U);
+  auto& input = inputs.front();
+  auto& meta = input.input_params.meta;
+  if (meta.is_graph_warmup || !meta.batch_forward_type.is_decode() ||
+      input.input_params.embedding.embedding_ids.empty()) {
+    return;
+  }
+  if (draft_step_controller_->sampling()) {
+    meta.mtp_draft_steps = draft_step_controller_->forced_steps();
+    meta.mtp_target_graph_rows = draft_step_controller_->forced_graph_rows();
+    draft_step_controller_->dispatched(
+        input.input_params.embedding.request_ids);
+    return;
+  }
+  const uint32_t rows =
+      static_cast<uint32_t>(input.input_params.embedding.embedding_ids.size());
+  const uint32_t maximum =
+      static_cast<uint32_t>(options_.num_speculative_tokens());
+  const auto& lengths = input.input_params.attention.host.kv_seq_lens;
+  CHECK(!lengths.empty());
+  const int32_t max_kv = *std::max_element(lengths.begin(), lengths.end());
+  CHECK_GT(max_kv, 0);
+  meta.mtp_draft_steps = draft_step_controller_->select(
+      rows, static_cast<uint32_t>(max_kv) + maximum);
+  draft_step_controller_->dispatched(input.input_params.embedding.request_ids);
+}
+
+void LLMEngine::observe_draft_step_acceptance(const RawForwardOutput& output) {
+  if (!draft_step_controller_) {
+    return;
+  }
+  std::vector<DraftStepAcceptanceObservation> observations;
+  observations.reserve(output.outputs.size());
+  for (const auto& row : output.outputs) {
+    const auto& stats = row.speculative_token_stats;
+    if (stats.verified_rounds != 1 || stats.proposed_tokens <= 0) {
+      continue;
+    }
+    CHECK_LE(stats.proposed_tokens, options_.num_speculative_tokens());
+    CHECK_GE(stats.accepted_tokens, 0);
+    CHECK_LE(stats.accepted_tokens, stats.proposed_tokens);
+    observations.emplace_back(DraftStepAcceptanceObservation{
+        static_cast<uint32_t>(stats.proposed_tokens),
+        static_cast<uint32_t>(stats.accepted_tokens)});
+  }
+  if (!observations.empty()) {
+    const uint64_t completed_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    draft_step_controller_->observe(observations, completed_ns);
+  }
+}
+
+ForwardOutput LLMEngine::step(BatchGroup& batch) {
+  if (worker_clients_.empty()) {
+    // empty worker, return
+    return {};
+  }
+  Timer timer;
+  DCHECK(dp_size_ == batch.size())
+      << "Split DP batch failed with dp_size as " << dp_size_
+      << " and actual batch size as " << batch.size() << ".";
+
+  std::vector<LlmForwardInput> forward_inputs;
+  bool is_graph_warmup = false;
+  forward_input_factory_->create_inputs(
+      batch, args_, forward_inputs, is_graph_warmup);
+  select_draft_steps(forward_inputs);
+  if (eplb_controller_ != nullptr) {
+    eplb_controller_->on_step_dispatched(forward_inputs, is_graph_warmup);
+  }
+  DCHECK(dp_size_ == forward_inputs.size())
+      << "The processed forward inputs size " << forward_inputs.size()
+      << " is not equal to dp size " << dp_size_ << ".";
+
+  if (dspark_dp_coordinator_ != nullptr && !is_graph_warmup) {
+    std::vector<std::vector<std::string>> sequence_ids;
+    sequence_ids.reserve(forward_inputs.size());
+    for (uint32_t shard = 0; shard < forward_inputs.size(); ++shard) {
+      const auto& embedding = forward_inputs[shard].input_params.embedding;
+      CHECK_EQ(embedding.embedding_ids.size(), embedding.request_ids.size());
+      std::vector<std::string> ids;
+      ids.reserve(embedding.embedding_ids.size());
+      for (uint32_t row = 0; row < embedding.embedding_ids.size(); ++row) {
+        ids.emplace_back(std::to_string(shard) + ":" +
+                         std::to_string(embedding.embedding_ids[row]) + ":" +
+                         embedding.request_ids[row]);
+      }
+      sequence_ids.emplace_back(std::move(ids));
+    }
+    const auto& parallel = forward_inputs.front().input_params.parallel;
+    const bool decode = std::all_of(parallel.dp_is_decode.begin(),
+                                    parallel.dp_is_decode.end(),
+                                    [](int32_t phase) { return phase == 1; });
+    const auto feedback =
+        dspark_dp_coordinator_->prepare(std::move(sequence_ids), decode);
+    CHECK(feedback.has_value()) << "Invalid adaptive DSpark DP dispatch order.";
+    std::vector<int32_t> kv_bounds = parallel.dp_global_kv_max_seq_lens;
+    if (decode) {
+      for (uint32_t shard = 0; shard < forward_inputs.size(); ++shard) {
+        const torch::Tensor tokens = forward_inputs[shard].host_token_ids();
+        const bool pending =
+            tokens.defined() && tokens.numel() != 0 &&
+            std::any_of(tokens.const_data_ptr<int32_t>(),
+                        tokens.const_data_ptr<int32_t>() + tokens.numel(),
+                        [](int32_t token) { return token < 0; });
+        kv_bounds[shard] += pending ? options_.num_speculative_tokens() : 0;
+      }
+    }
+    for (auto& input : forward_inputs) {
+      input.input_params.parallel.dp_dspark_confidence = feedback->confidence;
+      input.input_params.parallel.dp_dspark_rounds_since_full_width =
+          feedback->rounds_since_full_width;
+      input.input_params.parallel.dp_global_kv_max_seq_lens = kv_bounds;
+    }
+  }
+
+  std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
+  futures.reserve(worker_clients_num_);
+
+  // Engine sends full global tokens; model-side CP shards inside the worker.
+  for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
+    const int32_t dp_rank = worker_rank / dp_local_size_;
+    futures.emplace_back(worker_clients_[worker_rank]->step_remote_async(
+        forward_inputs[dp_rank]));
+  }
+
+  // wait for the all future to complete
+  auto results = folly::collectAll(futures).get();
+
+  DCHECK_EQ(dp_size_, worker_clients_num_ / dp_local_size_);
+  // Every worker must have produced a value before EPLB consumes all results
+  // and before promotions are committed to the shared prefix cache below; a
+  // failed worker must not reach those non-reversible steps.
+  for (uint32_t worker_rank = 0; worker_rank < worker_clients_num_;
+       ++worker_rank) {
+    if (!results[worker_rank].hasValue() || !results[worker_rank].value()) {
+      LOG(FATAL) << "Failed to execute model, result has no value";
+    }
+  }
+
+  if (eplb_controller_ != nullptr && !options_.enable_schedule_overlap() &&
+      !is_graph_warmup) {
+    eplb_controller_->on_step_completed(results, is_graph_warmup);
+  }
+
+  std::vector<RawForwardOutput> outputs;
+  outputs.reserve(dp_size_);
+  for (uint32_t worker_rank = 0; worker_rank < worker_clients_num_;
+       worker_rank += dp_local_size_) {
+    auto& result = results[worker_rank].value();
+    if (!options_.enable_schedule_overlap() && !is_graph_warmup) {
+      observe_draft_step_acceptance(*result);
+    }
+    outputs.emplace_back(std::move(result.value()));
+  }
+  batch.apply_outputs(outputs,
+                      options_.enable_schedule_overlap()
+                          ? BatchOutputAction::RESERVE_PENDING
+                          : BatchOutputAction::IMMEDIATE);
+
+  COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
+  return {};
+}
+
+std::vector<RawForwardOutput> LLMEngine::collect_step_outputs(
+    const BatchGroup& batch) {
+  CHECK_EQ(batch.size(), dp_size_);
+  const bool is_graph_warmup = contains_graph_warmup(batch);
+  std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
+  futures.reserve(worker_clients_num_);
+  std::vector<RawForwardOutput> raw_forward_outputs;
+  raw_forward_outputs.reserve(dp_size_);
+
+  // NOTE: We only need to get the output from the driver worker,
+  // cause the output on other workers is the same as that on driver.
+  // Under data parallelism (DP), we need to get dp_size outputs.
+  // The `stride` means the workers num we can skip.
+  // One retrievable result per DP group lives on its driver worker
+  // (dp_driver_: rank % (tp_size*cp_size) == 0), spaced dp_local_size_
+  // (= tp_size*cp_size) apart. dp_local_tp_size_ divides by cp_size, so
+  // under cp_size>1 it lands on cp_rank=1 non-driver workers whose
+  // get_last_step_result() waits indefinitely for a result they never publish.
+  uint32_t stride = dp_local_size_;
+  // If EPLB is enabled, we need to get results from all workers,
+  // because the experts on each worker are different,
+  // and the controller needs the token load of every expert shard.
+  // so we can not skip any worker.
+  // Each pipeline worker retains its completed Slot until the result is taken,
+  // including non-drivers. Retire every worker's Slot before the next submit.
+  if ((eplb_controller_ != nullptr &&
+       eplb_controller_->requires_all_worker_results()) ||
+      options_.enable_task_pipeline()) {
+    stride = 1;
+  }
+
+  for (auto worker_rank = 0; worker_rank < worker_clients_num_;
+       worker_rank += stride) {
+    futures.emplace_back(
+        worker_clients_[worker_rank]->get_last_llm_step_result_async());
+  }
+  // wait for the all future to complete
+  auto last_step_results = folly::collectAll(futures).get();
+  for (const auto& result : last_step_results) {
+    CHECK(result.hasValue() && result.value().has_value())
+        << "Failed to get last step results, result has no value";
+  }
+
+  if (eplb_controller_ != nullptr) {
+    eplb_controller_->on_step_completed(last_step_results, is_graph_warmup);
+  }
+
+  for (auto worker_rank = 0; worker_rank < worker_clients_num_;
+       worker_rank += dp_local_size_) {
+    auto& result = last_step_results[worker_rank / stride].value();
+    raw_forward_outputs.emplace_back(std::move(result.value()));
+    if (!is_graph_warmup) {
+      observe_draft_step_acceptance(raw_forward_outputs.back());
+    }
+  }
+
+  if (dspark_dp_coordinator_ != nullptr && !is_graph_warmup) {
+    std::vector<DSparkDpFeedback> feedback;
+    feedback.reserve(raw_forward_outputs.size());
+    for (auto& output : raw_forward_outputs) {
+      feedback.emplace_back(std::move(output.dspark_feedback));
+    }
+    CHECK(dspark_dp_coordinator_->retire(feedback))
+        << "Invalid adaptive DSpark DP result or retirement order.";
+  }
+
+  return raw_forward_outputs;
+}
+
+void LLMEngine::setup_workers(const runtime::Options& options) {
+  if (!distributed_worker_manager_) {
+    distributed_worker_manager_ =
+        std::make_shared<DistributedWorkerManager>(options);
+  }
+  worker_clients_ = distributed_worker_manager_->get_worker_clients();
+}
+
+bool LLMEngine::start_profile() {
+  std::lock_guard<std::mutex> lock(profile_mutex_);
+  LOG(INFO) << "Starting profiler on " << worker_clients_num_ << " worker(s).";
+  if (!profile_workers(/*is_start=*/true)) {
+    // A partially successful broadcast must not leave other workers tracing.
+    if (!profile_workers(/*is_start=*/false)) {
+      LOG(ERROR) << "Failed to clean up profiling on some workers. "
+                    "Retry /stop_profile.";
+    }
+    return false;
+  }
+  return true;
+}
+
+bool LLMEngine::stop_profile() {
+  std::lock_guard<std::mutex> lock(profile_mutex_);
+  LOG(INFO) << "Stopping profiler on " << worker_clients_num_ << " worker(s).";
+  return profile_workers(/*is_start=*/false);
+}
+
+bool LLMEngine::profile_workers(bool is_start) {
+  if (worker_clients_.empty()) {
+    LOG(ERROR) << "No worker clients available for profiling.";
+    return false;
+  }
+
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(worker_clients_num_);
+  for (auto& worker : worker_clients_) {
+    futures.emplace_back(is_start ? worker->start_profile_async()
+                                  : worker->stop_profile_async());
+  }
+
+  auto results = folly::collectAll(futures).get();
+  bool success = true;
+  for (const auto& result : results) {
+    if (result.hasException()) {
+      LOG(ERROR) << "Profiling worker RPC failed: "
+                 << result.exception().what();
+      success = false;
+      continue;
+    }
+    if (!result.value()) {
+      LOG(ERROR) << "Profiling failed on a worker (start=" << is_start << ").";
+      success = false;
+    }
+  }
+
+  return success;
+}
+
+}  // namespace xllm

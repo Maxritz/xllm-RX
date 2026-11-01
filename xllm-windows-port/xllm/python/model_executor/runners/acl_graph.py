@@ -1,0 +1,428 @@
+# Copyright 2026 The xLLM Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Capture and task-update mechanics shared by the two ACL input owners."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
+
+import torch
+import torch.nn as nn
+
+from scripts.logger import logger
+from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, LinearVerifyGraphInputs
+from xllm.python.attention.expanded_decode_metadata import ExpandedDecodeMetadata
+from xllm.python.model_executor.forward_context import (
+    AclGraphCaptureContext,
+    AclGraphTask,
+    EplbRuntimeState,
+    ForwardContext,
+    forward_context,
+)
+from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
+from xllm.python.model_executor.runners.decode_cuda_graph import _CAPTURE_WARMUP_STEPS
+
+_GRAPH_POOL: tuple[int, int] | None = None
+
+
+if TYPE_CHECKING:
+    from xllm.python.model_executor.input_batch import InputBatch
+
+
+def _get_graph_pool() -> tuple[int, int]:
+    global _GRAPH_POOL
+    if _GRAPH_POOL is None:
+        _GRAPH_POOL = torch.npu.graph_pool_handle()
+    return _GRAPH_POOL
+
+
+@dataclass(slots=True)
+class StaticGraphAttentionMetadata:
+    slot_mapping: torch.Tensor
+    paged_kv_indptr: torch.Tensor
+    paged_kv_indices: torch.Tensor
+    paged_kv_last_page_len: torch.Tensor
+    qo_indptr: torch.Tensor | None = None
+    q_cu_seq_lens: torch.Tensor | None = None
+    q_cu_seq_lens_host_values: list[int] | None = None
+    kv_cu_seq_lens: torch.Tensor | None = None
+    kv_seq_lens_host: torch.Tensor | None = None
+    kv_seq_lens_host_values: list[int] | None = None
+    q_seq_lens_host: torch.Tensor | None = None
+    new_cache_slots_host_values: list[int] | None = None
+    paged_kv_indptr_host: torch.Tensor | None = None
+    paged_kv_last_page_len_host: torch.Tensor | None = None
+    block_table: torch.Tensor | None = None
+    kv_seq_lens: torch.Tensor | None = None
+    linear_state_indices: torch.Tensor | None = None
+    linear_verify_graph: LinearVerifyGraphInputs | None = None
+    num_accepted_tokens: torch.Tensor | None = None
+    num_accepted_tokens_host_values: Sequence[int] = ()
+    linear_state_read_indices: torch.Tensor | None = None
+    linear_state_write_indices: torch.Tensor | None = None
+    has_initial_state: torch.Tensor | None = None
+    dp_execution_token_counts: Sequence[int] = ()
+    dp_global_sequence_nums: tuple[int, ...] = ()
+    dp_is_decode: tuple[int, ...] = ()
+    q_seq_lens: torch.Tensor | None = None
+    kpool_query_lens: tuple[int, ...] = ()
+    kpool_query_lens_device: torch.Tensor | None = None
+    expanded_decode_metadata: ExpandedDecodeMetadata | None = None
+    is_prefill: bool = False
+    is_chunked_prefill: bool = False
+    mega_moe_token_mask: torch.Tensor | None = None
+    is_mixed: bool = False
+    is_dummy: bool = False
+    is_spec_verify: bool = False
+    local_slot_mapping: torch.Tensor | None = None
+    kv_split_size: int = 1
+    kv_split_rank: int = 0
+    has_kv_shard: bool = False
+    multi_block_tables: Sequence[torch.Tensor | None] = ()
+    dsa_metadata: object | None = None
+    dsa_positions: torch.Tensor | None = None
+    dsa_cos_sin: torch.Tensor | None = None
+    dsa_c4_cos_sin: torch.Tensor | None = None
+    dsa_c128_cos_sin: torch.Tensor | None = None
+    dsa_graph_mode: bool = False
+    dsa_graph_block_table_cols: int = 0
+    prepared_attention_state: object | None = None
+
+
+class AclGraphEntry:
+    batch_size: int
+    static_input_ids: torch.Tensor
+    static_positions: torch.Tensor
+    static_metadata: StaticGraphAttentionMetadata
+
+    __slots__ = (
+        "batch_size",
+        "mega_moe_token_counts",
+        "graph",
+        "static_output",
+        "static_input_ids",
+        "static_positions",
+        "static_input_embedding",
+        "static_mtp_topk_indices",
+        "static_metadata",
+        "kv_seq_lens_delta",
+        "expanded_query_cu_seq_lens",
+        "graph_tasks",
+        "execution_state",
+        "eplb",
+        "layer_shared_cache",
+        "is_padding",
+        "graph_input_batch",
+        "replay_logged",
+        "kv_capacity_pages",
+    )
+
+    def __init__(self) -> None:
+        self.eplb: EplbRuntimeState | None = None
+        self.kv_capacity_pages = 0
+        self.is_padding: torch.Tensor | None = None
+        self.graph_input_batch: InputBatch | None = None
+        self.layer_shared_cache: dict[object, object] = {}
+
+
+class AclGraphRunner(BaseRunner):
+    """Shared device operations; subclasses own input storage and cache policy."""
+
+    def __init__(self, model: nn.Module, attention_backend: AttentionBackend, device: torch.device) -> None:
+        super().__init__(model, attention_backend, device)
+        self._update_stream: torch.npu.Stream | None = None
+        self._replay_done_event: torch.npu.Event | None = None
+        self._capture_error_mode = "global"
+
+    def _bind_graph_input_batch(self, entry: AclGraphEntry, input_batch: InputBatch | None) -> None:
+        if not self.execution_metadata_builders:
+            return
+        if input_batch is None:
+            raise RuntimeError("execution metadata builders require upstream InputBatch metadata")
+        token_capacity = entry.static_input_ids.numel()
+        is_padding = entry.is_padding
+        if is_padding is None or tuple(is_padding.shape) != (token_capacity,):
+            with torch.inference_mode(False):
+                entry.is_padding = torch.empty(token_capacity, dtype=torch.bool, device=input_batch.input_ids.device)
+            is_padding = entry.is_padding
+        is_padding.fill_(True)
+        is_padding[: input_batch.query_start_loc[input_batch.num_reqs]].fill_(False)
+        entry.graph_input_batch = input_batch.bind_graph_inputs(
+            entry.static_input_ids,
+            entry.static_positions,
+            is_padding,
+        )
+        execution_contexts = entry.layer_shared_cache
+        if not execution_contexts:
+            with torch.inference_mode(False):
+                for builder in self.execution_metadata_builders:
+                    execution_contexts[builder.metadata_type] = builder.allocate_persistent(
+                        entry.graph_input_batch, entry.static_metadata
+                    )
+        for builder in self.execution_metadata_builders:
+            if builder.metadata_type not in execution_contexts:
+                raise RuntimeError(f"missing persistent execution metadata for {builder.metadata_type.__name__}")
+            builder.update_persistent(
+                execution_contexts[builder.metadata_type], entry.graph_input_batch, entry.static_metadata
+            )
+
+    @staticmethod
+    def _fill_mega_moe_token_mask(entry: AclGraphEntry, token_counts: Sequence[int]) -> None:
+        mask = entry.static_metadata.mega_moe_token_mask
+        if mask is None:
+            return
+        token_counts = tuple(token_counts)
+        padded_batch_size = entry.batch_size
+        dp_size = mask.numel() // padded_batch_size
+        if len(token_counts) != dp_size or any(count < 0 or count > padded_batch_size for count in token_counts):
+            raise RuntimeError(
+                f"MegaMoe token counts must fit {dp_size} ACL graph batch buckets: "
+                f"counts={token_counts}, bucket={padded_batch_size}"
+            )
+        if token_counts == getattr(entry, "mega_moe_token_counts", None):
+            return
+        mask.zero_()
+        for rank, count in enumerate(token_counts):
+            if count:
+                start = rank * padded_batch_size
+                mask[start : start + count].fill_(1)
+        entry.mega_moe_token_counts = token_counts
+
+    def _prepare_graph_eplb_state(
+        self,
+        entry: AclGraphEntry,
+        eplb: EplbRuntimeState | None,
+        metadata: AttentionMetadata,
+        *,
+        first_capture: bool,
+    ) -> None:
+        if first_capture:
+            entry.eplb = self._allocate_graph_eplb_state(eplb, entry.batch_size)
+        entry_eplb = entry.eplb
+        if (entry_eplb is None) != (eplb is None):
+            raise RuntimeError("EPLB state changed after ACL graph capture")
+        if eplb is not None and entry_eplb is not None:
+            if entry_eplb.expert_load_data.data_ptr() != eplb.expert_load_data.data_ptr():
+                raise RuntimeError("EPLB expert-load tensor changed after ACL graph capture")
+            if (entry_eplb.decode_token_mask is None) != (eplb.decode_token_mask is None):
+                raise RuntimeError("EPLB decode-mask availability changed after ACL graph capture")
+            entry_eplb.is_graph_warmup = eplb.is_graph_warmup
+        self._fill_graph_eplb_decode_mask(entry, eplb, metadata)
+
+    def _allocate_graph_eplb_state(
+        self,
+        eplb: EplbRuntimeState | None,
+        padded_batch_size: int,
+    ) -> EplbRuntimeState | None:
+        if eplb is None:
+            return None
+        decode_token_mask = None
+        if eplb.decode_token_mask is not None:
+            with torch.inference_mode(False):
+                decode_token_mask = torch.zeros(
+                    padded_batch_size * self.dp_size,
+                    dtype=eplb.decode_token_mask.dtype,
+                    device=eplb.decode_token_mask.device,
+                )
+        return EplbRuntimeState(
+            expert_load_data=eplb.expert_load_data,
+            decode_token_mask=decode_token_mask,
+            is_graph_warmup=eplb.is_graph_warmup,
+        )
+
+    def _fill_graph_eplb_decode_mask(
+        self,
+        entry: AclGraphEntry,
+        eplb: EplbRuntimeState | None,
+        metadata: AttentionMetadata,
+    ) -> None:
+        entry_eplb = entry.eplb
+        if entry_eplb is None or entry_eplb.decode_token_mask is None:
+            return
+        if eplb is None or eplb.decode_token_mask is None:
+            raise RuntimeError("EPLB decode-mask state is missing for a captured graph")
+
+        destination = entry_eplb.decode_token_mask
+        source = eplb.decode_token_mask.reshape(-1)
+        destination.zero_()
+        if self.dp_size == 1:
+            if source.numel() > entry.batch_size:
+                raise RuntimeError("EPLB decode mask exceeds graph bucket capacity")
+            destination[: source.numel()].copy_(source)
+            return
+
+        raw_counts = tuple(metadata.raw_dp_execution_token_counts)
+        if len(raw_counts) != self.dp_size:
+            raise RuntimeError(f"DP decode step requires {self.dp_size} token counts, got {len(raw_counts)}")
+        if any(count < 0 or count > entry.batch_size for count in raw_counts):
+            raise RuntimeError(
+                f"DP token counts must fit the ACL graph batch bucket: counts={raw_counts}, bucket={entry.batch_size}"
+            )
+        if source.numel() != sum(raw_counts):
+            raise RuntimeError("EPLB decode mask does not match DP token counts")
+        source_begin = 0
+        for rank, count in enumerate(raw_counts):
+            destination_begin = rank * entry.batch_size
+            destination[destination_begin : destination_begin + count].copy_(
+                source[source_begin : source_begin + count]
+            )
+            source_begin += count
+
+    def _initialize_task_updates(self) -> None:
+        self._initialize_replay_state()
+        if self._update_stream is None:
+            self._update_stream = torch.npu.Stream(device=self.device, priority=-1)
+
+    def _initialize_replay_state(self) -> None:
+        if self._replay_done_event is None:
+            self._replay_done_event = torch.npu.Event()
+
+    def _prepare_attention(self, entry: AclGraphEntry, metadata: AttentionMetadata, *, replay: bool = False) -> None:
+        context = ForwardContext(
+            self.attention_backend,
+            self.device,
+            metadata,
+            self.layer_caches,
+            execution_state=entry.execution_state,
+            eplb=entry.eplb,
+        )
+        with forward_context(context):
+            if replay:
+                self.attention_backend.prepare_graph_replay(metadata)
+            else:
+                self.attention_backend.prepare(metadata, graph_mode=True)
+
+    def _update_after_replay(
+        self,
+        entry: AclGraphEntry,
+        stream: torch.npu.Stream,
+        completion_event: torch.npu.Event | None = None,
+    ) -> None:
+        if not entry.graph_tasks:
+            return
+        assert self._update_stream is not None
+        assert self._replay_done_event is not None
+        with torch.npu.stream(self._update_stream):
+            self._update_stream.wait_event(self._replay_done_event)
+            self._update_graph_tasks(self._update_stream, entry.graph_tasks)
+            if completion_event is not None:
+                completion_event.record(self._update_stream)
+        self._replay_done_event.record(stream)
+
+    @staticmethod
+    def _validate_decode_token_layout(
+        input_ids: torch.Tensor,
+        positions: torch.Tensor | None,
+        slot_mapping: torch.Tensor,
+        metadata_row_count: int,
+    ) -> None:
+        if input_ids.dim() != 1 or input_ids.numel() != metadata_row_count:
+            raise RuntimeError("ACL graph decode input_ids must contain one token per metadata row")
+        if slot_mapping.dim() != 1 or slot_mapping.numel() != metadata_row_count:
+            raise RuntimeError("ACL graph decode slot_mapping must contain one slot per token")
+        if positions is not None and (positions.dim() != 1 or positions.numel() != metadata_row_count):
+            raise RuntimeError("ACL graph decode positions must contain one value per token")
+
+    def _capture(
+        self,
+        entry: AclGraphEntry,
+        stream: torch.npu.Stream,
+    ) -> None:
+        assert stream is not None
+        logger.info(
+            "Python ACL graph capture start: model=%s bucket=%d mtp_topk=%s",
+            type(self.model).__name__,
+            entry.batch_size,
+            entry.static_mtp_topk_indices is not None,
+        )
+        # Input copies and backend metadata preparation run on the caller's
+        # stream. A new bucket's eager warmup must observe those writes before
+        # reading token IDs or page tables, just like an existing graph replay.
+        stream.wait_stream(torch.npu.current_stream())
+        context = ForwardContext(
+            self.attention_backend,
+            self.device,
+            entry.static_metadata,
+            self.layer_caches,
+            execution_state=entry.execution_state,
+            eplb=entry.eplb,
+            # Rebuild warmup-derived tensors inside capture.
+            layer_shared_cache=entry.layer_shared_cache.copy(),
+        )
+        with forward_context(context), torch.npu.stream(stream):
+            for _ in range(_CAPTURE_WARMUP_STEPS):
+                self._forward_static(entry)
+        torch.npu.synchronize()
+        entry.graph = torch.npu.NPUGraph()
+        capture_context = AclGraphCaptureContext(stream, [])
+        context = replace(context, acl_graph=capture_context, layer_shared_cache=entry.layer_shared_cache)
+        with (
+            forward_context(context),
+            torch.npu.graph(
+                entry.graph,
+                pool=_get_graph_pool(),
+                stream=stream,
+                capture_error_mode=self._capture_error_mode,
+            ),
+        ):
+            entry.static_output = self._forward_static(entry)
+        entry.graph_tasks = capture_context.tasks
+        logger.info(
+            "Python ACL graph captured: model=%s bucket=%d mtp_topk=%s tasks=%d",
+            type(self.model).__name__,
+            entry.batch_size,
+            entry.static_mtp_topk_indices is not None,
+            len(entry.graph_tasks),
+        )
+
+    def _forward_static(self, entry: AclGraphEntry) -> ModelExecutionOutput:
+        if entry.static_metadata.prepared_attention_state is not None:
+            # Quant-indexer metadata must be computed inside capture against
+            # the Slot length tensors, not reused from capture warmup.
+            self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
+        if entry.static_input_embedding is None:
+            if entry.static_mtp_topk_indices is None:
+                return self.model(entry.static_input_ids, entry.static_positions)
+            return self.model(
+                entry.static_input_ids,
+                entry.static_positions,
+                None,
+                entry.static_mtp_topk_indices,
+            )
+        if entry.static_mtp_topk_indices is None:
+            return self.model(
+                entry.static_input_ids,
+                entry.static_positions,
+                entry.static_input_embedding,
+            )
+        return self.model(
+            entry.static_input_ids,
+            entry.static_positions,
+            entry.static_input_embedding,
+            entry.static_mtp_topk_indices,
+        )
+
+    @staticmethod
+    def _update_graph_tasks(
+        stream: torch.npu.Stream,
+        graph_tasks: list[AclGraphTask],
+    ) -> None:
+        for task in graph_tasks:
+            torch.npu.graph_task_update_begin(stream, task.handle)
+            task.update()
+            torch.npu.graph_task_update_end(stream)
+            task.event.record(stream)

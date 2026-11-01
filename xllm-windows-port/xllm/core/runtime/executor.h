@@ -1,0 +1,82 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <torch/types.h>
+
+#include "core/kv_cache/storage/kv_cache.h"
+#include "framework/model/causal_lm.h"
+#include "framework/model/model_output.h"
+#include "framework/model/model_params_view.h"
+#include "runtime/executor_impl.h"
+#include "runtime/options.h"
+
+namespace xllm {
+
+class PyExecutorImpl;
+
+class Executor final {
+ public:
+  Executor(CausalLM* model,
+           const ModelArgs& args,
+           const torch::Device& device,
+           const runtime::Options& options);
+
+  virtual ~Executor() = default;
+
+  bool supports_prepared_attention_metadata() const;
+  bool supports_adaptive_unified_graph() const;
+  void warmup_adaptive_unified_graph(Executor& draft_executor,
+                                     const AdaptiveDSparkGraphTask& task,
+                                     ProcessGroup* sampling_group);
+  torch::Tensor run_adaptive_unified_graph(Executor& draft_executor,
+                                           const AdaptiveDSparkGraphTask& task,
+                                           ProcessGroup* sampling_group);
+  // Called on Prepare after binding Slot-owned tensor and native metadata.
+  // No model computation; the supported backend must not mutate active state.
+  void prepare_attention_metadata(std::vector<KVCache>& kv_caches,
+                                  ModelParamsView& params);
+
+  // Regular warmup Tasks capture final Slot views before serving uses them.
+  void warmup_prepared_graph(const torch::Tensor& tokens,
+                             const torch::Tensor& positions,
+                             std::vector<KVCache>& kv_caches,
+                             const ModelParamsView& params);
+
+  ModelOutput forward(const torch::Tensor& tokens,
+                      const torch::Tensor& positions,
+                      std::vector<KVCache>& kv_caches,
+                      const ModelParamsView& params);
+
+  void prepare_graph_input(const torch::Tensor& tokens,
+                           const torch::Tensor& positions,
+                           std::vector<KVCache>& kv_caches,
+                           const ModelParamsView& params);
+
+  bool prepare_static_mtp_graph_tasks(const SpecVerifyGraphTaskSignal& signal,
+                                      const Stream& signal_stream);
+
+  // Returns the Python executor when this instance is backed by
+  // ``model_impl=python``. Native executors return nullptr. The accessor is
+  // used by the MTP pair bridge to share one Python composite graph between
+  // target and draft workers.
+  PyExecutorImpl* python_impl();
+
+ private:
+  std::unique_ptr<ExecutorImpl> impl_;
+};
+
+}  // namespace xllm

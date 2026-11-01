@@ -1,0 +1,172 @@
+/* Copyright 2025-2026 The xLLM Authors.
+Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <folly/futures/Future.h>
+#include <torch/types.h>
+
+#include "common/types.h"
+#include "core/kv_cache/layout/kv_cache_shape.h"
+#include "forward_params.h"
+#include "framework/model/causal_lm.h"
+#include "framework/model/model_args.h"
+#include "framework/model/model_params_view.h"
+#include "framework/quantization/quant_args.h"
+#include "framework/state_dict/state_dict.h"
+#include "runtime/executor.h"
+#include "runtime/options.h"
+#include "runtime/worker_impl.h"
+#include "util/threadpool.h"
+
+namespace xllm {
+class VlmForwardInput;
+struct SpecCalibrationCommand;
+
+class Worker {
+ public:
+  Worker(const ParallelArgs& parallel_args,
+         const torch::Device& device,
+         const runtime::Options& options,
+         WorkerType worker_type);
+
+  ~Worker();
+
+  // Stop ingress before waking result waiters and draining service queues.
+  void begin_shutdown();
+
+  // initialize model, cache manager. blocking call
+  bool init_model(const std::string& model_weights_path,
+                  int32_t random_seed,
+                  MasterStatus master_status);
+
+  bool sleep(MasterStatus master_status, uint64_t transition_id = 0);
+
+  bool wakeup(const WakeupOptions& options);
+
+  folly::SemiFuture<bool> wakeup_async(const WakeupOptions& options);
+
+  // Start/stop online timeline profiling on this worker's device.
+  bool start_profile();
+
+  bool stop_profile();
+
+  folly::SemiFuture<bool> start_profile_async();
+
+  folly::SemiFuture<bool> stop_profile_async();
+
+  std::tuple<int64_t, int64_t> estimate_kv_cache_capacity();
+
+  // allocate kv cache. blocking call
+  bool allocate_kv_cache(const KVCacheShape& kv_cache_shape);
+
+  std::optional<std::string> spec_calibration(
+      const SpecCalibrationCommand& command);
+
+  void get_cache_info(uint64_t& cluster_id, std::string& addr, uint16_t& port);
+
+  bool link_cluster(const std::vector<uint64_t>& cluster_ids,
+                    const std::vector<std::string>& addrs,
+                    const std::vector<uint16_t>& ports);
+
+  bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
+                      const std::vector<std::string>& addrs,
+                      const std::vector<uint16_t>& ports);
+
+  // P2P link for weight transfer
+  bool link_p2p(const std::string& remote_addr);
+  bool unlink_p2p(const std::string& remote_addr);
+
+  const bool is_driver();
+  bool task_pipeline_uses_worker_prepare() const;
+
+  std::optional<ForwardOutput> step(const RecForwardInput& inputs);
+  std::optional<ForwardOutput> step(const VlmForwardInput& inputs);
+
+  std::optional<ForwardOutput> step(const DiTForwardInput& inputs);
+
+  std::optional<ForwardOutput> step(const LlmForwardInput& inputs);
+
+  // initialize model, cache manager. async call
+  folly::SemiFuture<bool> init_model_async(
+      const std::string& model_weights_path,
+      int32_t random_seed,
+      MasterStatus master_status);
+
+  folly::SemiFuture<std::tuple<int64_t, int64_t>>
+  estimate_kv_cache_capacity_async();
+
+  // initialize kv cache. async call
+  folly::SemiFuture<bool> allocate_kv_cache_async(
+      const KVCacheShape& kv_cache_shape);
+
+  // initialize kv cache with kv cache transfer. async call
+  virtual folly::SemiFuture<bool> allocate_kv_cache_with_transfer_async(
+      const KVCacheShape& kv_cache_shape);
+
+  virtual folly::SemiFuture<bool> pull_kv_blocks_async(
+      const uint64_t src_cluster_id,
+      const std::string& src_addr,
+      const std::vector<KVTransferMapping>& mappings);
+
+  virtual uint32_t transfer_kv_blocks(
+      const uint64_t batch_id,
+      const std::vector<BlockTransferInfo>& block_transfer_info);
+
+  virtual uint32_t transfer_kv_blocks(
+      const uint64_t batch_id,
+      Slice<BlockTransferInfo>& block_transfer_info);
+
+  virtual std::vector<uint8_t> prefetch_kv_blocks(
+      Slice<BlockTransferInfo>& block_transfer_info);
+
+  // Run the model asynchronously. Task pipeline with overlap returns an
+  // empty PrepareAck; the shared Slot pipeline retires the result later.
+  folly::SemiFuture<std::optional<ForwardOutput>> step_async(
+      const LlmForwardInput& inputs);
+
+  folly::SemiFuture<std::optional<ForwardOutput>> step_async(
+      const DiTForwardInput& inputs);
+
+  folly::SemiFuture<std::optional<ForwardOutput>> step_async(
+      const RecForwardInput& inputs);
+
+  folly::SemiFuture<std::optional<ForwardOutput>> step_async(
+      const VlmForwardInput& inputs);
+
+  folly::SemiFuture<folly::Unit> process_group_test_async();
+
+  const torch::Device& device() const;
+
+  // Task results use the shared FIFO and retain the worker's ready event when
+  // execution is worker-owned.
+  folly::SemiFuture<std::optional<ForwardOutput>> get_last_step_result_async();
+
+  int64_t get_active_activation_memory();
+
+  folly::SemiFuture<int64_t> get_active_activation_memory_async();
+
+ private:
+  bool initialize_task_pipeline();
+  bool enable_task_pipeline_ = false;
+  WorkerImpl* impl_ = nullptr;
+  std::unique_ptr<TaskExecutionPipeline> task_pipeline_;
+  ThreadPool threadpool_{/*num_threads=*/1,
+                         /*cpu_binding=*/false,
+                         /*pool_name=*/"Worker.async"};
+};
+
+}  // namespace xllm

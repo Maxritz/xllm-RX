@@ -1,0 +1,294 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <concepts>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "core/common/macros.h"
+#include "core/common/types.h"
+#include "core/distributed_runtime/engine.h"
+#include "core/framework/batch/batch_factory.h"
+#include "core/framework/block/block_manager_pool.h"
+#include "core/framework/request/request.h"
+#include "core/framework/request/sequence.h"
+#include "core/framework/speculative/adaptive/spec_startup_calibration.h"
+#include "core/runtime/options.h"
+#include "core/scheduler/profile/decode_graph_warmup_plan.h"
+#include "core/scheduler/profile/time_predictor.h"
+
+namespace xllm {
+class DistributedWorkerManager;
+class SpeculativeConfig;
+
+std::vector<int32_t> build_step_time_profile_batch_sizes(
+    int32_t max_seqs_per_batch);
+
+// Returns the decode sequence length bound used to measure graph-mode decode
+// capacity during warmup. FIA decode replays refresh dynamic host parameters,
+// so the FIA path measures with the larger FIA warmup bound instead of the
+// default 16 to keep measured memory aligned with real captures.
+int32_t warmup_decode_seq_len(bool fia_enabled, int32_t max_context_len);
+
+std::string spec_calibration_compatibility(const runtime::Options& options);
+class ProfileManager {
+ private:
+  using StepCallback = std::function<ForwardOutput(BatchGroup&)>;
+  using ResultCallback = std::function<void(BatchGroup&)>;
+
+ public:
+  struct Options {
+    PROPERTY(bool, enable_schedule_overlap) = false;
+
+    PROPERTY(bool, enable_task_pipeline) = false;
+    PROPERTY(bool, enable_adaptive_target_verify) = false;
+    PROPERTY(bool, enable_adaptive_draft_step) = false;
+    PROPERTY(std::string, adaptive_target_verify_calibration);
+    PROPERTY(std::string, adaptive_target_verify_cost_table);
+    PROPERTY(std::string, adaptive_target_verify_cost_table_output);
+    PROPERTY(std::string, spec_calibration_compatibility);
+
+    PROPERTY(int32_t, dp_size) = 1;
+
+    PROPERTY(DecodeGraphWarmupConfig, decode_graph_warmup_config) = {};
+
+    // config for profile
+    PROPERTY(bool, enable_profile_step_time) = false;
+
+    PROPERTY(bool, enable_profile_token_budget) = false;
+
+    PROPERTY(int32_t, profile_max_prompt_length) = 2048;
+
+    PROPERTY(bool, enable_profile_kv_blocks) = true;
+
+    PROPERTY(int32_t,
+             max_tokens_per_batch) = std::numeric_limits<int32_t>::max();
+
+    PROPERTY(int32_t, max_seqs_per_batch) = 1024;
+
+    PROPERTY(int32_t, max_global_ttft_ms) = std::numeric_limits<int32_t>::max();
+
+    PROPERTY(int32_t, max_global_tpot_ms) = std::numeric_limits<int32_t>::max();
+
+    PROPERTY(InstanceRole, instance_role) = InstanceRole::DEFAULT;
+  };
+
+  struct CopyBlockProfile {
+    std::string model_name;
+    int block_size;
+    double slope;      // milliseconds per block
+    double intercept;  // milliseconds constant overhead
+    std::string note;
+  };
+  template <typename TargetEngine>
+    requires requires(TargetEngine* engine, BatchGroup& batch) {
+      static_cast<Engine*>(engine);
+      { engine->step(batch) } -> std::same_as<ForwardOutput>;
+      {
+        engine->collect_step_outputs(batch)
+      } -> std::same_as<std::vector<RawForwardOutput>>;
+    }
+  ProfileManager(TargetEngine* engine,
+                 const Options& options,
+                 std::shared_ptr<DistributedWorkerManager>
+                     distributed_worker_manager = nullptr)
+      : ProfileManager(
+            static_cast<Engine*>(engine),
+            options,
+            [engine](BatchGroup& batch) { return engine->step(batch); },
+            [engine](BatchGroup& batch) {
+              batch.apply_outputs(engine->collect_step_outputs(batch),
+                                  BatchOutputAction::COMMIT_PENDING);
+            },
+            std::move(distributed_worker_manager)) {}
+
+  int32_t get_token_budget();
+
+  int32_t get_max_copy_block_num(double latency_budget);
+
+  double predict_copy_blocks_time(size_t num_copy_blocks,
+                                  bool if_need_add_constant_term = true);
+
+  // for single sequence
+  double predict_step_time(int32_t length,
+                           int32_t prefix_length = 0,
+                           bool if_need_add_constant_term = true,
+                           bool force_use_prefill_predictor = false);
+
+  double predict_step_time(Sequence* sequence,
+                           bool if_need_add_constant_term = true,
+                           bool force_use_prefill_predictor = false);
+  // for single batch or sequences
+  double predict_step_time(int32_t length,
+                           int32_t prefix_length,
+                           int32_t batch_size);
+
+  double predict_step_time(const std::vector<int32_t>& length_vec,
+                           const std::vector<int32_t>& prefix_length_vec);
+  // Generate a request of token_length and prefix_length, finally
+  // executing and returning the inference time.
+  double run_request(int32_t token_length,
+                     int32_t prefix_length,
+                     int32_t batch_size = 1,
+                     int32_t extra_token_length = 0,
+                     bool is_graph_warmup = true);
+  double run_request(const std::vector<int32_t>& token_length_vec,
+                     const std::vector<int32_t>& prefix_length_vec);
+
+  // Generate a batch of decode requests in DECODE stage and execute one decode
+  // step, then return the step latency.
+  double profile_decode_step_time(int32_t token_length,
+                                  int32_t batch_size,
+                                  int32_t min_context_len,
+                                  int32_t max_context_len);
+
+  void train_prefill_time_predictor(
+      std::vector<std::tuple<int32_t, int32_t, double>> time_profiling_data);
+
+  void train_decode_time_predictor(
+      std::vector<std::tuple<int32_t, int32_t, double>> time_profiling_data);
+
+  void train_prefill_time_predictor(
+      std::vector<std::pair<int32_t, double>> time_profiling_data);
+
+  double get_constant_overhead();
+
+  int32_t get_quadratic_root(Sequence* sequence, double budget);
+
+  std::vector<double> get_coefficients(bool is_prefill = true);
+
+  void profile_step_time(bool if_dump_to_file);
+
+ private:
+  void dump_step_time_profile_to_file(
+      const std::vector<std::pair<int32_t, double>>& time_profiling_data,
+      bool is_prefill);
+
+  void dump_step_time_profile_to_file(
+      const std::vector<std::tuple<int32_t, int32_t, double>>&
+          time_profiling_data,
+      bool is_prefill);
+
+  std::shared_ptr<Request> generate_single_request(int32_t token_length,
+                                                   int32_t prefix_length,
+                                                   bool is_graph_warmup = true);
+  std::shared_ptr<Request> generate_single_decode_request(
+      int32_t total_length,
+      std::optional<int32_t> dp_rank = std::nullopt,
+      bool is_graph_warmup = true);
+  std::shared_ptr<Request> try_generate_single_decode_request(
+      int32_t total_length,
+      std::optional<int32_t> dp_rank = std::nullopt,
+      bool is_graph_warmup = true);
+  int32_t measure_graph_decode_capacity(int32_t configured_max_seqs,
+                                        int32_t total_length);
+
+  std::string generate_filename(const std::string& file_suffix);
+
+  void eval_sequence_latency_prediction();
+
+  void eval_batch_latency_prediction(const std::string mode);
+
+  void profile_token_budget();
+
+  // Warm up eager NPU operators before the service becomes ready.
+  void warmup_for_eager();
+
+  // Warmup ACL graph executor according to the instance role.
+  void warmup_for_graph();
+
+  void warmup_prefill_for_graph();
+
+  void warmup_decode_for_graph();
+
+  void warmup_unified_for_graph();
+
+  bool check_if_satisfy_slo(int32_t num_tokens, int32_t tpot_slo_ms);
+
+  int32_t binary_search_max_tokens(int32_t tpot_slo_ms,
+                                   int32_t lower_bound,
+                                   int32_t upper_bound);
+
+  // Generate a batch of random decode requests with an average total sequence
+  // length of token_length.
+  void generate_random_decode_batch(int32_t total_length,
+                                    int32_t batch_size,
+                                    int32_t min_context_len,
+                                    int32_t max_context_len,
+                                    std::vector<int32_t>& token_length_vec);
+
+  double run_decode_request(const std::vector<int32_t>& total_length_vec);
+
+  double run_graph_decode_request(const std::vector<int32_t>& total_length_vec);
+
+  static const std::vector<ProfileManager::CopyBlockProfile>&
+  get_copy_block_profile();
+
+  const ProfileManager::CopyBlockProfile* find_profile(
+      const std::string& model_name,
+      int block_size) const;
+
+ private:
+  friend class ContinuousSchedulerBase;
+
+  ProfileManager(
+      Engine* engine,
+      const Options& options,
+      StepCallback step_callback,
+      ResultCallback result_callback,
+      std::shared_ptr<DistributedWorkerManager> distributed_worker_manager);
+
+  void calibrate_spec_startup();
+  void calibrate_draft_step_startup();
+  void run_startup_speculative_sample(
+      const SpecStartupCalibrationConfig& config,
+      const SpecCalibrationPoint& point,
+      uint64_t sample_id,
+      const std::function<void()>& after_prefill,
+      const std::function<void()>& after_drain);
+
+  const SpecStartupCalibrationConfig& target_verify_calibration_config();
+  int32_t adaptive_calibration_warmup_seq_len(int32_t default_length);
+  std::optional<SpecStartupCalibrationConfig> target_verify_calibration_config_;
+
+  std::unique_ptr<TimePredictor> prefill_time_predictor_;
+  std::unique_ptr<TimePredictor> decode_time_predictor_;
+
+  const Options options_;
+
+  Engine* engine_;
+  std::shared_ptr<DistributedWorkerManager> distributed_worker_manager_;
+  StepCallback step_callback_;
+  ResultCallback result_callback_;
+  BatchFactory batch_factory_;
+
+  DecodeGraphWarmupPlan decode_graph_warmup_plan_;
+
+  BlockManagerPool* block_manager_pool_;
+
+  int32_t profile_length_step_ = 256;
+
+  int32_t profile_count_per_step_ = 3;
+
+  int32_t profile_token_budget_ = std::numeric_limits<int32_t>::max();
+};
+
+}  // namespace xllm

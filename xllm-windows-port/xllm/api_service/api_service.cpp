@@ -1,0 +1,1406 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "api_service.h"
+
+#include <brpc/closure_guard.h>
+#include <brpc/controller.h>
+#include <butil/iobuf.h>
+#include <glog/logging.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+#include <google/protobuf/util/json_util.h>
+#include <json2pb/json_to_pb.h>
+#include <json2pb/pb_to_json.h>
+
+#include <charconv>
+#include <limits>
+#include <utility>
+
+#include "api_service/anthropic_request_utils.h"
+#include "api_service/chat_json_parser.h"
+#include "api_service/chat_request_decoder.h"
+#include "api_service/openai_http.h"
+#include "api_service/openai_request.h"
+#include "api_service/request_id.h"
+#include "api_service/rpc_request_metrics.h"
+#include "api_service/service_impl_factory.h"
+#include "api_service/serving_mode.h"
+#include "call.h"
+#include "chat.pb.h"
+#include "common.pb.h"
+#include "completion.pb.h"
+#include "core/common/constants.h"
+#include "core/common/metrics.h"
+#include "core/common/types.h"
+#include "core/framework/config/distributed_config.h"
+#include "core/util/closure_guard.h"
+#include "embedding.pb.h"
+#include "image_generation.pb.h"
+#include "models.pb.h"
+#include "text_generation.pb.h"
+#include "video_generation.pb.h"
+namespace xllm {
+
+namespace {
+template <typename Call>
+google::protobuf::Arena* GetArenaWithCheck(
+    const google::protobuf::Message* message) {
+  if (xllm::is_stream_call_v<Call>) {
+    return nullptr;
+  } else {
+    return message->GetArena();
+  }
+}
+
+const char* kSampleNotSupportedError = "/v1/sample is only supported for LLM";
+
+// Shared dispatch for brpc-typed (non-Http) APIs that follow the standard
+// service_impl -> process_async pattern.  Performs argument validation,
+// instantiates the appropriate Call wrapper from the typed proto request and
+// hands it off to the corresponding service implementation.
+//
+// `service_name` is the human readable endpoint name used in error messages
+// when the corresponding service implementation is not available (for example,
+// invoking /v1/images/generations against an LLM master).
+template <typename CallT, typename Service>
+void process_typed_brpc_request(std::unique_ptr<Service>& service_impl,
+                                ::google::protobuf::RpcController* controller,
+                                const typename CallT::ReqType* request,
+                                typename CallT::ResType* response,
+                                ::google::protobuf::Closure* done,
+                                const char* service_name) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  if (!service_impl) {
+    std::string msg =
+        std::string(service_name) + " service is not available on this server";
+    ctrl->SetFailed(msg);
+    LOG(ERROR) << msg;
+    return;
+  }
+
+  auto arena = GetArenaWithCheck<CallT>(response);
+  // brpc passes the request as `const`, but downstream Call wrappers only read
+  // from it.  We cast away constness so the Call can hold a non-const pointer.
+  auto req_pb = const_cast<typename CallT::ReqType*>(request);
+  std::shared_ptr<Call> call = std::make_shared<CallT>(
+      ctrl, done_guard.release(), req_pb, response, arena != nullptr);
+  service_impl->process_async(call);
+}
+
+bool parse_control_http_request(brpc::Controller* controller,
+                                google::protobuf::Message* request) {
+  std::string error;
+  json2pb::Json2PbOptions options;
+  butil::IOBufAsZeroCopyInputStream input(controller->request_attachment());
+  if (!json2pb::JsonToProtoMessage(&input, request, options, &error)) {
+    controller->SetFailed(error);
+    LOG(ERROR) << "parse json to proto failed: " << error;
+    return false;
+  }
+  return true;
+}
+
+void write_control_http_status(brpc::Controller* controller,
+                               const Status& status) {
+  // P2P operation failures return ok=false; a missing model fails the HTTP
+  // call.
+  if (status.code() == StatusCode::NOT_FOUND) {
+    controller->SetFailed(status.message());
+    return;
+  }
+  proto::Status response;
+  response.set_ok(status.ok());
+  json2pb::Pb2JsonOptions options;
+  options.bytes_to_base64 = false;
+  std::string error;
+  butil::IOBufAsZeroCopyOutputStream output(&controller->response_attachment());
+  if (!json2pb::ProtoMessageToJson(response, &output, options, &error)) {
+    LOG(ERROR) << "proto to json failed: " << error;
+  }
+}
+
+}  // namespace
+
+APIService::APIService(Master* master,
+                       const std::vector<std::string>& model_names,
+                       const std::vector<std::string>& model_repository_names,
+                       const std::vector<std::string>& model_versions)
+    : master_manager_(std::make_shared<MasterManager>()),
+      control_service_impl_(
+          std::make_unique<ControlServiceImpl>(master_manager_)) {
+  CHECK(master != nullptr);
+  CHECK(!model_names.empty());
+  default_model_ = model_names.front();
+  for (const auto& model_name : model_names) {
+    CHECK(master_manager_->register_external_master(model_name, master));
+  }
+  if (::xllm::DistributedConfig::get_instance().node_rank() != 0) {
+    return;
+  }
+  system_fingerprint_ = api_service::openai_system_fingerprint(
+      master->options(), master->model_args());
+  ServiceImplFactory::create(
+      this, master, model_names, model_repository_names, model_versions);
+  register_chat_completions_handler();
+}
+
+void APIService::Completions(::google::protobuf::RpcController* controller,
+                             const proto::CompletionRequest* request,
+                             proto::CompletionResponse* response,
+                             ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null.";
+    return;
+  }
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+
+  if (completion_service_impl_) {
+    completion_service_impl_->process_async_rpc_impl(request);
+  } else if (rec_completion_service_impl_) {
+    auto arena = GetArenaWithCheck<CompletionCall>(response);
+    std::shared_ptr<Call> call = std::make_shared<CompletionCall>(
+        ctrl,
+        done_guard.release(),
+        const_cast<proto::CompletionRequest*>(request),
+        response,
+        arena != nullptr);
+    rec_completion_service_impl_->process_async(call);
+  }
+}
+
+void APIService::CompletionsHttp(::google::protobuf::RpcController* controller,
+                                 const proto::HttpRequest* request,
+                                 proto::HttpResponse* response,
+                                 ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto arena = GetArenaWithCheck<CompletionCall>(response);
+  auto req_pb =
+      google::protobuf::Arena::CreateMessage<proto::CompletionRequest>(arena);
+  auto resp_pb =
+      google::protobuf::Arena::CreateMessage<proto::CompletionResponse>(arena);
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+
+  std::string error_param;
+  bool schema_error = false;
+  auto [preprocess_status, processed_json] =
+      api_service::normalize_openai_request(
+          ctrl->request_attachment().to_string(),
+          api_service::OpenAIEndpoint::COMPLETION,
+          default_model_,
+          &error_param,
+          &schema_error);
+  if (!preprocess_status.ok()) {
+    api_service::write_openai_error(ctrl,
+                                    preprocess_status.code(),
+                                    preprocess_status.message(),
+                                    error_param,
+                                    schema_error);
+    LOG(ERROR) << "completion prompt preprocessing failed: "
+               << preprocess_status.message();
+    return;
+  }
+
+  std::string error;
+  json2pb::Json2PbOptions options;
+  auto st =
+      json2pb::JsonToProtoMessage(processed_json, req_pb, options, &error);
+  if (!st || !error.empty()) {
+    api_service::write_openai_error(ctrl, StatusCode::INVALID_ARGUMENT, error);
+    LOG(ERROR) << "parse json to proto failed: " << error;
+    return;
+  }
+
+  if (!completion_service_impl_ && !rec_completion_service_impl_) {
+    api_service::write_openai_error(ctrl,
+                                    StatusCode::INVALID_ARGUMENT,
+                                    "The model does not support completions.");
+    return;
+  }
+  if (rec_completion_service_impl_ && req_pb->prompts_size() > 0) {
+    api_service::write_openai_error(ctrl,
+                                    StatusCode::INVALID_ARGUMENT,
+                                    "Batched prompts require the LLM backend.");
+    return;
+  }
+  auto call = std::make_shared<CompletionCall>(ctrl,
+                                               done_guard.release(),
+                                               req_pb,
+                                               resp_pb,
+                                               arena != nullptr,
+                                               /*is_http_request=*/true);
+  call->set_system_fingerprint(system_fingerprint_);
+  if (completion_service_impl_) {
+    completion_service_impl_->process_async(call);
+  } else if (rec_completion_service_impl_) {
+    rec_completion_service_impl_->process_async(call);
+  }
+}
+
+void APIService::Sample(::google::protobuf::RpcController* controller,
+                        const proto::SampleRequest* request,
+                        proto::SampleResponse* response,
+                        ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null.";
+    return;
+  }
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  if (!sample_service_impl_) {
+    ctrl->SetFailed(kSampleNotSupportedError);
+    return;
+  }
+
+  Status status;
+  if (!sample_service_impl_->process_request(*request, response, &status)) {
+    ctrl->SetFailed(status.message());
+    LOG(ERROR) << "sample request failed: " << status.message();
+  }
+}
+
+void APIService::SampleHttp(::google::protobuf::RpcController* controller,
+                            const proto::HttpRequest* request,
+                            proto::HttpResponse* response,
+                            ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+  if (!sample_service_impl_) {
+    ctrl->SetFailed(kSampleNotSupportedError);
+    return;
+  }
+
+  auto arena = GetArenaWithCheck<SampleCall>(response);
+  auto req_pb =
+      google::protobuf::Arena::CreateMessage<proto::SampleRequest>(arena);
+  auto resp_pb =
+      google::protobuf::Arena::CreateMessage<proto::SampleResponse>(arena);
+
+  std::string error;
+  json2pb::Json2PbOptions options;
+  butil::IOBuf& buf = ctrl->request_attachment();
+  butil::IOBufAsZeroCopyInputStream iobuf_stream(buf);
+  auto st = json2pb::JsonToProtoMessage(&iobuf_stream, req_pb, options, &error);
+  if (!st) {
+    ctrl->SetFailed(error);
+    LOG(ERROR) << "parse json to proto failed: " << error;
+    return;
+  }
+
+  std::shared_ptr<Call> call =
+      std::make_shared<SampleCall>(ctrl,
+                                   done_guard.release(),
+                                   req_pb,
+                                   resp_pb,
+                                   arena != nullptr,
+                                   /*is_http_request=*/true);
+  sample_service_impl_->process_async(call);
+}
+
+namespace {
+
+size_t get_json_content_length(const brpc::Controller* ctrl) {
+  const std::string* content_len =
+      ctrl->http_request().GetHeader(kInferContentLength);
+  if (content_len == nullptr) {
+    content_len = ctrl->http_request().GetHeader(kContentLength);
+  }
+  if (content_len != nullptr) {
+    size_t length = 0;
+    const char* begin = content_len->data();
+    const char* end = begin + content_len->size();
+    const auto parsed = std::from_chars(begin, end, length);
+    if (parsed.ec == std::errc{} && parsed.ptr == end) {
+      return length;
+    }
+    LOG(ERROR) << "Invalid JSON content length.";
+  } else {
+    LOG(ERROR) << "Content-Length header is missing.";
+  }
+  return std::numeric_limits<size_t>::max();
+}
+
+template <typename CallT, typename Service>
+void media_generation_http_impl(std::unique_ptr<Service>& service,
+                                xllm::ClosureGuard& guard,
+                                brpc::Controller* ctrl,
+                                const proto::HttpRequest* request,
+                                proto::HttpResponse* response) {
+  const size_t json_content_length = get_json_content_length(ctrl);
+  if (json_content_length == static_cast<size_t>(-1L)) {
+    ctrl->SetFailed("JSON content length header is missing or invalid.");
+    return;
+  }
+  const butil::IOBuf& attachment = ctrl->request_attachment();
+  if (json_content_length > attachment.size() ||
+      json_content_length >
+          static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    ctrl->SetFailed("JSON content length exceeds request attachment.");
+    return;
+  }
+
+  auto arena = GetArenaWithCheck<CallT>(response);
+  auto req_pb =
+      google::protobuf::Arena::CreateMessage<typename CallT::ReqType>(arena);
+  // Arena allocations belong to brpc. Heap allocations need an owner until
+  // the Call takes responsibility, including JSON parsing failure paths.
+  std::unique_ptr<typename CallT::ReqType> request_owner(
+      arena == nullptr ? req_pb : nullptr);
+
+  butil::IOBufAsZeroCopyInputStream attachment_stream(attachment);
+  google::protobuf::io::LimitingInputStream json_stream(
+      &attachment_stream, static_cast<int64_t>(json_content_length));
+  std::string error;
+  json2pb::Json2PbOptions options;
+  if (!json2pb::JsonToProtoMessage(&json_stream, req_pb, options, &error)) {
+    ctrl->SetFailed(error);
+    LOG(ERROR) << "parse json to proto failed: " << error;
+    return;
+  }
+
+  auto resp_pb =
+      google::protobuf::Arena::CreateMessage<typename CallT::ResType>(arena);
+  std::unique_ptr<typename CallT::ResType> response_owner(
+      arena == nullptr ? resp_pb : nullptr);
+  std::shared_ptr<Call> call =
+      std::make_shared<CallT>(ctrl,
+                              guard.release(),
+                              req_pb,
+                              resp_pb,
+                              arena != nullptr,
+                              /*is_http_request=*/true);
+  request_owner.release();
+  response_owner.release();
+  service->process_async(call);
+}
+
+}  // namespace
+
+namespace {
+
+template <typename ChatCall, typename Service>
+void chat_completions_http_impl(std::unique_ptr<Service>& service,
+                                xllm::ClosureGuard& guard,
+                                brpc::Controller* ctrl,
+                                const proto::HttpRequest* request,
+                                proto::HttpResponse* response,
+                                const ChatJsonParser& chat_json_parser,
+                                const std::string& default_model,
+                                const std::string& system_fingerprint) {
+  auto arena = GetArenaWithCheck<ChatCall>(response);
+  auto req_pb =
+      google::protobuf::Arena::CreateMessage<typename ChatCall::ReqType>(arena);
+  auto resp_pb =
+      google::protobuf::Arena::CreateMessage<typename ChatCall::ResType>(arena);
+
+  auto [body_status, attachment] = api_service::openai_request_body(
+      *ctrl, /*binary_input=*/std::is_same_v<ChatCall, MMChatCall>);
+  if (!body_status.ok()) {
+    api_service::write_openai_error(
+        ctrl, body_status.code(), body_status.message());
+    return;
+  }
+  std::string error_param;
+  bool schema_error = false;
+  auto [normalization_status, normalized] =
+      api_service::normalize_openai_request(std::move(attachment),
+                                            api_service::OpenAIEndpoint::CHAT,
+                                            default_model,
+                                            &error_param,
+                                            &schema_error);
+  if (!normalization_status.ok()) {
+    api_service::write_openai_error(ctrl,
+                                    normalization_status.code(),
+                                    normalization_status.message(),
+                                    error_param,
+                                    schema_error);
+    return;
+  }
+
+  auto [preprocess_status, processed_json] =
+      chat_json_parser.preprocess(std::move(normalized));
+  if (!preprocess_status.ok()) {
+    api_service::write_openai_error(
+        ctrl, preprocess_status.code(), preprocess_status.message());
+    LOG(ERROR) << "Complex message preprocessing failed: "
+               << preprocess_status.message();
+    return;
+  }
+
+  const Status status = decode_chat_request(std::move(processed_json), req_pb);
+  if (!status.ok()) {
+    api_service::write_openai_error(ctrl, status.code(), status.message());
+    LOG(ERROR) << "parse json to proto failed: " << status.message();
+    return;
+  }
+
+  auto call = std::make_shared<ChatCall>(ctrl,
+                                         guard.release(),
+                                         req_pb,
+                                         resp_pb,
+                                         /*use_arena=*/arena != nullptr,
+                                         /*is_http_request=*/true);
+  call->set_system_fingerprint(system_fingerprint);
+  service->process_async(call);
+}
+
+}  // namespace
+
+void APIService::register_chat_completions_handler() {
+  if (mm_chat_service_impl_) {
+    chat_completions_handler_ = [this](ClosureGuard& guard,
+                                       brpc::Controller* ctrl,
+                                       const proto::HttpRequest* request,
+                                       proto::HttpResponse* response) {
+      chat_completions_http_impl<MMChatCall, MMChatServiceImpl>(
+          mm_chat_service_impl_,
+          guard,
+          ctrl,
+          request,
+          response,
+          ChatJsonParser::get(ServingMode::VLM),
+          default_model_,
+          system_fingerprint_);
+    };
+  } else if (chat_service_impl_) {
+    chat_completions_handler_ = [this](ClosureGuard& guard,
+                                       brpc::Controller* ctrl,
+                                       const proto::HttpRequest* request,
+                                       proto::HttpResponse* response) {
+      chat_completions_http_impl<ChatCall, ChatServiceImpl>(
+          chat_service_impl_,
+          guard,
+          ctrl,
+          request,
+          response,
+          ChatJsonParser::get(ServingMode::LLM),
+          default_model_,
+          system_fingerprint_);
+    };
+  }
+}
+
+void APIService::ChatCompletions(::google::protobuf::RpcController* controller,
+                                 const proto::ChatRequest* request,
+                                 proto::ChatResponse* response,
+                                 ::google::protobuf::Closure* done) {
+  // TODO with xllm-service
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  // Maybe need double check later
+
+  chat_service_impl_->process_async_rpc_impl(request);
+}
+
+void APIService::ChatCompletionsHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+
+  if (!chat_completions_handler_) {
+    api_service::write_openai_error(
+        ctrl,
+        StatusCode::INVALID_ARGUMENT,
+        "The model does not support chat completions.");
+    LOG(ERROR) << "No chat completions handler registered";
+    return;
+  }
+  chat_completions_handler_(done_guard, ctrl, request, response);
+}
+
+void APIService::Embeddings(::google::protobuf::RpcController* controller,
+                            const proto::EmbeddingRequest* request,
+                            proto::EmbeddingResponse* response,
+                            ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  if (!embedding_service_impl_) {
+    const char* msg =
+        "Embeddings brpc API only supports the text embedding service. "
+        "Use /v1/embeddings http endpoint for multimodal embeddings.";
+    ctrl->SetFailed(msg);
+    LOG(ERROR) << msg;
+    return;
+  }
+
+  auto arena = GetArenaWithCheck<EmbeddingCall>(response);
+  // The brpc-typed request is passed as const, but downstream code only reads
+  // from it (after defaulting the encoding format below).
+  auto req_pb = const_cast<proto::EmbeddingRequest*>(request);
+  if (req_pb->encoding_format().empty()) {
+    req_pb->set_encoding_format("float");
+  }
+
+  std::shared_ptr<Call> call = std::make_shared<EmbeddingCall>(
+      ctrl, done_guard.release(), req_pb, response, arena != nullptr);
+  embedding_service_impl_->process_async(call);
+}
+
+namespace {
+template <typename EmbeddingCall, typename Service>
+void handle_embedding_request(std::unique_ptr<Service>& embedding_service_impl_,
+                              ::google::protobuf::RpcController* controller,
+                              const proto::HttpRequest* request,
+                              proto::HttpResponse* response,
+                              ::google::protobuf::Closure* done,
+                              const std::string& default_model) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto arena = GetArenaWithCheck<EmbeddingCall>(response);
+  auto req_pb =
+      google::protobuf::Arena::CreateMessage<typename EmbeddingCall::ReqType>(
+          arena);
+  auto resp_pb =
+      google::protobuf::Arena::CreateMessage<typename EmbeddingCall::ResType>(
+          arena);
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+  std::string error;
+  json2pb::Json2PbOptions options;
+  constexpr api_service::OpenAIEndpoint endpoint =
+      std::is_same_v<typename EmbeddingCall::ReqType, proto::EmbeddingRequest>
+          ? api_service::OpenAIEndpoint::EMBEDDING
+          : api_service::OpenAIEndpoint::MM_EMBEDDING;
+  auto [body_status, attachment] = api_service::openai_request_body(
+      *ctrl,
+      /*binary_input=*/endpoint == api_service::OpenAIEndpoint::MM_EMBEDDING);
+  if (!body_status.ok()) {
+    api_service::write_openai_error(
+        ctrl, body_status.code(), body_status.message());
+    return;
+  }
+  std::string error_param;
+  bool schema_error = false;
+  auto [status, body] =
+      api_service::normalize_openai_request(std::move(attachment),
+                                            endpoint,
+                                            default_model,
+                                            &error_param,
+                                            &schema_error);
+  if (!status.ok()) {
+    api_service::write_openai_error(
+        ctrl, status.code(), status.message(), error_param, schema_error);
+    return;
+  }
+  const bool st = json2pb::JsonToProtoMessage(body, req_pb, options, &error);
+  if (!st || !error.empty()) {
+    api_service::write_openai_error(ctrl, StatusCode::INVALID_ARGUMENT, error);
+    LOG(ERROR) << "parse json to proto failed: " << error;
+    return;
+  }
+
+  // default set to "float"
+  if (req_pb->encoding_format().empty()) {
+    req_pb->set_encoding_format("float");
+  }
+
+  std::shared_ptr<Call> call =
+      std::make_shared<EmbeddingCall>(ctrl,
+                                      done_guard.release(),
+                                      req_pb,
+                                      resp_pb,
+                                      arena != nullptr,
+                                      /*is_http_request=*/true);
+  embedding_service_impl_->process_async(call);
+}
+}  // namespace
+
+void APIService::EmbeddingsHttp(::google::protobuf::RpcController* controller,
+                                const proto::HttpRequest* request,
+                                proto::HttpResponse* response,
+                                ::google::protobuf::Closure* done) {
+  if (embedding_service_impl_) {
+    handle_embedding_request<EmbeddingCall, EmbeddingServiceImpl>(
+        embedding_service_impl_,
+        controller,
+        request,
+        response,
+        done,
+        default_model_);
+  } else if (mm_embedding_service_impl_) {
+    handle_embedding_request<MMEmbeddingCall, MMEmbeddingServiceImpl>(
+        mm_embedding_service_impl_,
+        controller,
+        request,
+        response,
+        done,
+        default_model_);
+  } else {
+    brpc::ClosureGuard guard(done);
+    auto* ctrl = static_cast<brpc::Controller*>(controller);
+    api_service::write_openai_error(ctrl,
+                                    StatusCode::INVALID_ARGUMENT,
+                                    "The model does not support embeddings.");
+  }
+}
+
+void APIService::ImageGeneration(::google::protobuf::RpcController* controller,
+                                 const proto::ImageGenerationRequest* request,
+                                 proto::ImageGenerationResponse* response,
+                                 ::google::protobuf::Closure* done) {
+  process_typed_brpc_request<ImageGenerationCall, ImageGenerationServiceImpl>(
+      image_generation_service_impl_,
+      controller,
+      request,
+      response,
+      done,
+      "ImageGeneration");
+}
+
+void APIService::ImageGenerationHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+  if (!image_generation_service_impl_) {
+    ctrl->SetFailed("ImageGeneration service is not available on this server");
+    return;
+  }
+  media_generation_http_impl<ImageGenerationCall>(
+      image_generation_service_impl_, done_guard, ctrl, request, response);
+}
+
+void APIService::AudioGeneration(::google::protobuf::RpcController* controller,
+                                 const proto::AudioGenerationRequest* request,
+                                 proto::AudioGenerationResponse* response,
+                                 ::google::protobuf::Closure* done) {
+  process_typed_brpc_request<AudioGenerationCall, AudioGenerationServiceImpl>(
+      audio_generation_service_impl_,
+      controller,
+      request,
+      response,
+      done,
+      "AudioGeneration");
+}
+
+void APIService::AudioGenerationHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+  if (!audio_generation_service_impl_) {
+    ctrl->SetFailed("AudioGeneration service is not available on this server");
+    return;
+  }
+  media_generation_http_impl<AudioGenerationCall>(
+      audio_generation_service_impl_, done_guard, ctrl, request, response);
+}
+
+void APIService::TextGeneration(::google::protobuf::RpcController* controller,
+                                const proto::TextGenerationRequest* request,
+                                proto::TextGenerationResponse* response,
+                                ::google::protobuf::Closure* done) {
+  process_typed_brpc_request<TextGenerationCall, TextGenerationServiceImpl>(
+      text_generation_service_impl_,
+      controller,
+      request,
+      response,
+      done,
+      "TextGeneration");
+}
+
+void APIService::TextGenerationHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto arena = GetArenaWithCheck<TextGenerationCall>(response);
+  auto req_pb =
+      google::protobuf::Arena::CreateMessage<proto::TextGenerationRequest>(
+          arena);
+  auto resp_pb =
+      google::protobuf::Arena::CreateMessage<proto::TextGenerationResponse>(
+          arena);
+
+  brpc::Controller* ctrl = static_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+  std::string error;
+  json2pb::Json2PbOptions options;
+  butil::IOBuf& buf = ctrl->request_attachment();
+  butil::IOBufAsZeroCopyInputStream iobuf_stream(buf);
+  bool st = json2pb::JsonToProtoMessage(&iobuf_stream, req_pb, options, &error);
+  if (!st) {
+    ctrl->SetFailed(error);
+    LOG(ERROR) << "parse json to proto failed: " << error;
+    return;
+  }
+  std::shared_ptr<TextGenerationCall> call =
+      std::make_shared<TextGenerationCall>(ctrl,
+                                           done_guard.release(),
+                                           req_pb,
+                                           resp_pb,
+                                           arena != nullptr,
+                                           /*is_http_request=*/true);
+  text_generation_service_impl_->process_async(call);
+}
+
+void APIService::VideoGeneration(::google::protobuf::RpcController* controller,
+                                 const proto::VideoGenerationRequest* request,
+                                 proto::VideoGenerationResponse* response,
+                                 ::google::protobuf::Closure* done) {
+  process_typed_brpc_request<VideoGenerationCall, VideoGenerationServiceImpl>(
+      video_generation_service_impl_,
+      controller,
+      request,
+      response,
+      done,
+      "VideoGeneration");
+}
+
+void APIService::VideoGenerationHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+  if (!video_generation_service_impl_) {
+    ctrl->SetFailed("VideoGeneration service is not available on this server");
+    return;
+  }
+  media_generation_http_impl<VideoGenerationCall>(
+      video_generation_service_impl_, done_guard, ctrl, request, response);
+}
+
+void APIService::Rerank(::google::protobuf::RpcController* controller,
+                        const proto::RerankRequest* request,
+                        proto::RerankResponse* response,
+                        ::google::protobuf::Closure* done) {
+  process_typed_brpc_request<RerankCall, RerankServiceImpl>(
+      rerank_service_impl_, controller, request, response, done, "Rerank");
+}
+
+void APIService::RerankHttp(::google::protobuf::RpcController* controller,
+                            const proto::HttpRequest* request,
+                            proto::HttpResponse* response,
+                            ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto arena = GetArenaWithCheck<RerankCall>(response);
+  auto req_pb =
+      google::protobuf::Arena::CreateMessage<proto::RerankRequest>(arena);
+  auto resp_pb =
+      google::protobuf::Arena::CreateMessage<proto::RerankResponse>(arena);
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+  std::string error;
+  json2pb::Json2PbOptions options;
+  butil::IOBuf& buf = ctrl->request_attachment();
+  butil::IOBufAsZeroCopyInputStream iobuf_stream(buf);
+  auto st = json2pb::JsonToProtoMessage(&iobuf_stream, req_pb, options, &error);
+  if (!st) {
+    ctrl->SetFailed(error);
+    LOG(ERROR) << "parse json to proto failed: " << error;
+    return;
+  }
+
+  std::shared_ptr<Call> call =
+      std::make_shared<RerankCall>(ctrl,
+                                   done_guard.release(),
+                                   req_pb,
+                                   resp_pb,
+                                   arena != nullptr,
+                                   /*is_http_request=*/true);
+  rerank_service_impl_->process_async(call);
+}
+
+void APIService::Models(::google::protobuf::RpcController* controller,
+                        const proto::ModelListRequest* request,
+                        proto::ModelListResponse* response,
+                        ::google::protobuf::Closure* done) {
+  // TODO with xllm-service
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  bool st_models = models_service_impl_->list_models(nullptr, response);
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+
+  if (!st_models) {
+    ctrl->SetFailed("list models failed.");
+    LOG(ERROR) << "list models failed.";
+    return;
+  }
+}
+
+void APIService::ModelsHttp(::google::protobuf::RpcController* controller,
+                            const proto::HttpRequest* request,
+                            proto::HttpResponse* response,
+                            ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  ctrl->http_response().set_content_type("application/json");
+  api_service::ensure_http_x_request_id(ctrl);
+  auto arena = response->GetArena();
+  auto resp_pb =
+      google::protobuf::Arena::CreateMessage<proto::ModelListResponse>(arena);
+
+  bool st_models = models_service_impl_->list_models(nullptr, resp_pb);
+  if (!st_models) {
+    LOG(ERROR) << "list models failed.";
+    return;
+  }
+
+  ctrl->response_attachment().append(
+      api_service::openai_models_json(*resp_pb).dump());
+}
+
+void APIService::ModelVersionsHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  ctrl->response_attachment().append(
+      models_service_impl_->list_model_versions());
+
+  return;
+}
+
+namespace {
+
+void anthropic_http_error(brpc::Controller* ctrl,
+                          int32_t status,
+                          const std::string& type,
+                          const std::string& message) {
+  ctrl->http_response().set_status_code(status);
+  ctrl->http_response().set_content_type("application/json");
+  ctrl->response_attachment().clear();
+  ctrl->response_attachment().append(
+      nlohmann::json({{"type", "error"},
+                      {"error", {{"type", type}, {"message", message}}}})
+          .dump());
+}
+
+void handle_anthropic_messages(std::unique_ptr<AnthropicServiceImpl>& service,
+                               xllm::ClosureGuard& guard,
+                               brpc::Controller* ctrl,
+                               proto::HttpResponse* response,
+                               bool count_tokens) {
+  if (ctrl->http_request().method() != brpc::HTTP_METHOD_POST) {
+    ctrl->http_response().set_status_code(405);
+    ctrl->http_response().set_content_type("application/json");
+    ctrl->http_response().SetHeader("Allow", "POST");
+    ctrl->response_attachment().append(R"({"detail":"Method Not Allowed"})");
+    return;
+  }
+  const std::string& content_type = ctrl->http_request().content_type();
+  std::string media_type = content_type.substr(0, content_type.find(';'));
+  std::transform(media_type.begin(),
+                 media_type.end(),
+                 media_type.begin(),
+                 [](unsigned char value) { return std::tolower(value); });
+  if (media_type != "application/json") {
+    api_service::write_openai_error(
+        ctrl,
+        StatusCode::INVALID_ARGUMENT,
+        "Unsupported Media Type: Only 'application/json' is allowed",
+        "",
+        /*schema_error=*/true);
+    return;
+  }
+  if (!service) {
+    anthropic_http_error(
+        ctrl,
+        501,
+        "NotImplementedError",
+        "Anthropic messages API is only supported for LLM engine");
+    return;
+  }
+  auto [preprocess_status, processed_json] =
+      ChatJsonParser::anthropic().preprocess(
+          ctrl->request_attachment().to_string());
+  if (!preprocess_status.ok()) {
+    api_service::write_openai_error(ctrl,
+                                    StatusCode::INVALID_ARGUMENT,
+                                    preprocess_status.message(),
+                                    "",
+                                    /*schema_error=*/true);
+    return;
+  }
+  proto::AnthropicMessagesRequest parsed_request;
+  const Status status = api_service::parse_anthropic_request(
+      processed_json, count_tokens, parsed_request);
+  if (!status.ok()) {
+    api_service::write_openai_error(ctrl,
+                                    StatusCode::INVALID_ARGUMENT,
+                                    status.message(),
+                                    "",
+                                    /*schema_error=*/true);
+    return;
+  }
+  Status validation =
+      api_service::validate_anthropic_request(parsed_request, count_tokens);
+  if (!validation.ok()) {
+    api_service::write_openai_error(ctrl,
+                                    StatusCode::INVALID_ARGUMENT,
+                                    validation.message(),
+                                    "",
+                                    /*schema_error=*/true);
+    return;
+  }
+  if (!service->supports_model(parsed_request.model())) {
+    anthropic_http_error(
+        ctrl,
+        404,
+        "NotFoundError",
+        "The model `" + parsed_request.model() + "` does not exist.");
+    return;
+  }
+  const Status backend =
+      api_service::validate_anthropic_backend(parsed_request, count_tokens);
+  if (!backend.ok()) {
+    const bool internal = backend.code() == StatusCode::UNKNOWN;
+    anthropic_http_error(ctrl,
+                         internal ? 500 : 400,
+                         internal ? "internal_error" : "BadRequestError",
+                         backend.message());
+    return;
+  }
+  auto* arena = GetArenaWithCheck<AnthropicCall>(response);
+  auto* req_pb =
+      google::protobuf::Arena::CreateMessage<proto::AnthropicMessagesRequest>(
+          arena);
+  req_pb->Swap(&parsed_request);
+  auto* resp_pb =
+      google::protobuf::Arena::CreateMessage<proto::AnthropicMessagesResponse>(
+          arena);
+  auto call = std::make_shared<AnthropicCall>(ctrl,
+                                              guard.release(),
+                                              req_pb,
+                                              resp_pb,
+                                              /*use_arena=*/arena != nullptr,
+                                              /*is_http_request=*/true);
+  if (count_tokens) {
+    service->count_tokens(std::move(call));
+  } else {
+    service->process_async(std::move(call));
+  }
+}
+
+}  // namespace
+
+void APIService::AnthropicMessagesHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+
+  handle_anthropic_messages(anthropic_service_impl_,
+                            done_guard,
+                            ctrl,
+                            response,
+                            /*count_tokens=*/false);
+}
+
+void APIService::AnthropicCountTokensHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    return;
+  }
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+  handle_anthropic_messages(anthropic_service_impl_,
+                            done_guard,
+                            ctrl,
+                            response,
+                            /*count_tokens=*/true);
+}
+
+void APIService::ForkMaster(::google::protobuf::RpcController* controller,
+                            const proto::MasterInfos* request,
+                            proto::Status* response,
+                            ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  const Status status = control_service_impl_->fork_master(*request);
+  response->set_ok(status.ok());
+  if (!status.ok()) {
+    static_cast<brpc::Controller*>(controller)->SetFailed(status.message());
+  }
+}
+
+void APIService::ForkMasterHttp(::google::protobuf::RpcController* controller,
+                                const proto::HttpRequest* request,
+                                proto::HttpResponse* response,
+                                ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  proto::MasterInfos parsed_request;
+  if (!parse_control_http_request(ctrl, &parsed_request)) {
+    return;
+  }
+  const Status status = control_service_impl_->fork_master(parsed_request);
+  if (!status.ok()) {
+    ctrl->SetFailed(status.message());
+  }
+}
+
+void APIService::Sleep(::google::protobuf::RpcController* controller,
+                       const proto::MasterInfos* request,
+                       proto::Status* response,
+                       ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  const Status status = control_service_impl_->sleep(*request);
+  response->set_ok(status.ok());
+  if (!status.ok()) {
+    static_cast<brpc::Controller*>(controller)->SetFailed(status.message());
+  }
+}
+
+void APIService::SleepHttp(::google::protobuf::RpcController* controller,
+                           const proto::HttpRequest* request,
+                           proto::HttpResponse* response,
+                           ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  proto::MasterInfos parsed_request;
+  if (!parse_control_http_request(ctrl, &parsed_request)) {
+    return;
+  }
+  const Status status = control_service_impl_->sleep(parsed_request);
+  if (!status.ok()) {
+    ctrl->SetFailed(status.message());
+  }
+}
+
+void APIService::Wakeup(::google::protobuf::RpcController* controller,
+                        const proto::MasterInfos* request,
+                        proto::Status* response,
+                        ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  const Status status = control_service_impl_->wakeup(*request);
+  response->set_ok(status.ok());
+  if (!status.ok()) {
+    static_cast<brpc::Controller*>(controller)->SetFailed(status.message());
+  }
+}
+
+void APIService::WakeupHttp(::google::protobuf::RpcController* controller,
+                            const proto::HttpRequest* request,
+                            proto::HttpResponse* response,
+                            ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  proto::MasterInfos parsed_request;
+  if (!parse_control_http_request(ctrl, &parsed_request)) {
+    return;
+  }
+  const Status status = control_service_impl_->wakeup(parsed_request);
+  if (!status.ok()) {
+    ctrl->SetFailed(status.message());
+  }
+}
+
+void APIService::StartProfileHttp(::google::protobuf::RpcController* controller,
+                                  const proto::HttpRequest* request,
+                                  proto::HttpResponse* response,
+                                  ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  const Status status = control_service_impl_->start_profile();
+  if (!status.ok()) {
+    ctrl->SetFailed(status.message());
+  }
+}
+
+void APIService::StopProfileHttp(::google::protobuf::RpcController* controller,
+                                 const proto::HttpRequest* request,
+                                 proto::HttpResponse* response,
+                                 ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  const Status status = control_service_impl_->stop_profile();
+  if (!status.ok()) {
+    ctrl->SetFailed(status.message());
+  }
+}
+
+void APIService::LinkP2P(::google::protobuf::RpcController* controller,
+                         const proto::P2PLinkRequest* request,
+                         proto::Status* response,
+                         ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  const Status status = control_service_impl_->link_p2p(*request);
+  response->set_ok(status.ok());
+}
+
+void APIService::LinkP2PHttp(::google::protobuf::RpcController* controller,
+                             const proto::HttpRequest* request,
+                             proto::HttpResponse* response,
+                             ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  proto::P2PLinkRequest parsed_request;
+  if (!parse_control_http_request(ctrl, &parsed_request)) {
+    return;
+  }
+  const Status status = control_service_impl_->link_p2p(parsed_request);
+  write_control_http_status(ctrl, status);
+}
+
+void APIService::UnlinkP2P(::google::protobuf::RpcController* controller,
+                           const proto::P2PLinkRequest* request,
+                           proto::Status* response,
+                           ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  const Status status = control_service_impl_->unlink_p2p(*request);
+  response->set_ok(status.ok());
+}
+
+void APIService::UnlinkP2PHttp(::google::protobuf::RpcController* controller,
+                               const proto::HttpRequest* request,
+                               proto::HttpResponse* response,
+                               ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = static_cast<brpc::Controller*>(controller);
+  proto::P2PLinkRequest parsed_request;
+  if (!parse_control_http_request(ctrl, &parsed_request)) {
+    return;
+  }
+  const Status status = control_service_impl_->unlink_p2p(parsed_request);
+  write_control_http_status(ctrl, status);
+}
+
+}  // namespace xllm

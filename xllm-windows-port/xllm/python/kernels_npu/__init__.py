@@ -1,0 +1,271 @@
+# Copyright 2026 The xLLM Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""NPU kernel semantic API.
+
+Ordinary package import is build-safe and does not inspect native operators.
+The embedded runtime calls :func:`_initialize_runtime` through
+``xllm.python.initialize_runtime`` after ``torch.ops.xllm_ops`` is registered.
+Leaf DSL packages under ``tilelang`` and ``triton`` therefore remain directly
+importable by build tooling without initializing this semantic API.
+"""
+
+from __future__ import annotations
+
+import importlib
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .gated_delta_net import mega_gdn_decode, mega_gdn_mtp_decode, mega_gdn_mtp_decode_varlen, mega_gdn_prefill
+
+
+_EXPORTS = {
+    "activation": ("silu_and_mul", "fused_sigmoid_mul"),
+    "attention": (
+        "reshape_paged_cache",
+        "update_decode_graph_metadata",
+        "vision_fusion_attention",
+    ),
+    "causal_conv1d": (
+        "causal_conv1d_decode",
+        "causal_conv1d_qkv_prefill",
+        "causal_conv1d_update_v2",
+    ),
+    "gated_delta_net": (
+        "chunk_gated_delta_rule",
+        "fused_gdn_gating",
+        "fused_sigmoid_gating_delta_rule_decode",
+        "mega_gdn_decode",
+        "mega_gdn_mtp_decode",
+        "mega_gdn_mtp_decode_varlen",
+        "mega_gdn_prefill",
+    ),
+    "linear": (
+        "grouped_linear",
+        "atb_matmul_ein_sum",
+        "atb_matmul_ein_sum_out",
+        "prepare_quant_weight",
+        "prepare_row_parallel_weight",
+    ),
+    "mla": (
+        "MLA_PREPROCESS_V2_MAX_TOKENS",
+        "deepseek_mla_preprocess_decode",
+        "deepseek_mla_preprocess_decode_dynamic",
+        "deepseek_mla_preprocess_decode_v2",
+        "has_mla_preprocess_v2",
+        "prepare_mla_preprocess_v2_q_b",
+        "prepare_mla_preprocess_v2_qkv",
+        "supports_mla_preprocess_v2",
+        "supports_mla_kv_cache_slot_reuse",
+    ),
+    "moe": (
+        "cutlass_fused_moe",
+        "format_cast_nz",
+        "fused_moe",
+        "grouped_moe",
+        "grouped_moe_with_routing",
+        "grouped_moe_bf16",
+        "moe_expert_compute",
+        "moe_fused_topk",
+        "dequant_swiglu_quant",
+        "grouped_moe_with_selected_experts",
+        "moe_gating_top_k_hash",
+        "moe_gate_routing",
+        "mega_moe",
+        "encode_mega_moe_scale",
+        "moe_gmm1",
+        "moe_gmm2_combine",
+        "moe_expert_compute_with_routing",
+        "moe_finalize_routing",
+        "moe_token_dispatch",
+        "prepare_grouped_moe_weights",
+        "supports_cutlass_moe",
+        "supports_fused_moe_gmm1",
+    ),
+    "normalization": (
+        "fused_add_rms_norm",
+        "fused_add_gemma_rms_norm",
+        "fused_add_rms_norm_dynamic_quant",
+        "fused_eh_norm",
+        "gemma_rms_norm",
+        "l2_norm",
+        "rms_norm",
+        "rms_norm_dynamic_quant",
+        "rms_norm_gated",
+        "rms_norm_sigmoid_gated",
+    ),
+    "quantization": (
+        "dynamic_quant",
+        "quant_matmul",
+        "quant_matmul_out",
+        "quantize_per_tensor",
+    ),
+    "rotary_embedding": (
+        "build_split_qkv_rmsnorm_mrope_gather_pattern",
+        "fused_qk_norm_rope",
+        "has_split_qkv_rmsnorm_mrope_specialization",
+        "interleaved_rotary_embedding",
+        "npu_inplace_partial_rotary_mul",
+        "split_qkv_rmsnorm_mrope",
+        "mrope",
+        "vision_rotary_mul",
+    ),
+    "sparse_attention": (
+        "POOL_KEY_INDEXER_MASK_MODE",
+        "dynamic_block_quant",
+        "kv_quant_sparse_flash_attention",
+        "lightning_indexer",
+        "lightning_indexer_out",
+        "pool_key_indexer",
+        "supports_pool_key_indexer",
+        "quant_lightning_indexer",
+        "quant_lightning_indexer_metadata",
+        "scatter_nd_update",
+        "sparse_flash_attention",
+        "sparse_flash_attention_out",
+        "sparse_flash_attention_lse",
+        "sparse_flash_attention_lse_out",
+    ),
+    "dsa": (
+        "compressor",
+        "hc_post",
+        "hc_pre",
+        "sparse_attn_sharedkv",
+        "sparse_attn_sharedkv_metadata",
+    ),
+}
+
+__all__ = [
+    "rms_norm",
+    "gemma_rms_norm",
+    "fused_add_rms_norm",
+    "fused_add_gemma_rms_norm",
+    "fused_add_rms_norm_dynamic_quant",
+    "rms_norm_dynamic_quant",
+    "l2_norm",
+    "rms_norm_gated",
+    "POOL_KEY_INDEXER_MASK_MODE",
+    "rms_norm_sigmoid_gated",
+    "fused_eh_norm",
+    "fused_sigmoid_mul",
+    "silu_and_mul",
+    "dequant_swiglu_quant",
+    "reshape_paged_cache",
+    "update_decode_graph_metadata",
+    "vision_fusion_attention",
+    "atb_matmul_ein_sum",
+    "grouped_linear",
+    "atb_matmul_ein_sum_out",
+    "fused_qk_norm_rope",
+    "build_split_qkv_rmsnorm_mrope_gather_pattern",
+    "has_split_qkv_rmsnorm_mrope_specialization",
+    "interleaved_rotary_embedding",
+    "npu_inplace_partial_rotary_mul",
+    "split_qkv_rmsnorm_mrope",
+    "mrope",
+    "vision_rotary_mul",
+    "moe_fused_topk",
+    "cutlass_fused_moe",
+    "format_cast_nz",
+    "fused_moe",
+    "grouped_moe",
+    "grouped_moe_with_routing",
+    "grouped_moe_bf16",
+    "moe_gate_routing",
+    "mega_moe",
+    "encode_mega_moe_scale",
+    "moe_expert_compute",
+    "moe_expert_compute_with_routing",
+    "moe_token_dispatch",
+    "moe_gmm1",
+    "moe_gmm2_combine",
+    "moe_finalize_routing",
+    "grouped_moe_with_selected_experts",
+    "prepare_grouped_moe_weights",
+    "supports_cutlass_moe",
+    "supports_fused_moe_gmm1",
+    "prepare_row_parallel_weight",
+    "prepare_quant_weight",
+    "MLA_PREPROCESS_V2_MAX_TOKENS",
+    "deepseek_mla_preprocess_decode",
+    "deepseek_mla_preprocess_decode_dynamic",
+    "deepseek_mla_preprocess_decode_v2",
+    "has_mla_preprocess_v2",
+    "prepare_mla_preprocess_v2_q_b",
+    "prepare_mla_preprocess_v2_qkv",
+    "supports_mla_preprocess_v2",
+    "supports_mla_kv_cache_slot_reuse",
+    "quant_matmul",
+    "quant_matmul_out",
+    "quantize_per_tensor",
+    "dynamic_quant",
+    "dynamic_block_quant",
+    "kv_quant_sparse_flash_attention",
+    "lightning_indexer",
+    "lightning_indexer_out",
+    "pool_key_indexer",
+    "supports_pool_key_indexer",
+    "quant_lightning_indexer",
+    "quant_lightning_indexer_metadata",
+    "scatter_nd_update",
+    "sparse_flash_attention",
+    "sparse_flash_attention_out",
+    "sparse_flash_attention_lse",
+    "sparse_flash_attention_lse_out",
+    "causal_conv1d_decode",
+    "compressor",
+    "dequant_swiglu_quant",
+    "hc_pre",
+    "hc_post",
+    "moe_gating_top_k_hash",
+    "sparse_attn_sharedkv",
+    "sparse_attn_sharedkv_metadata",
+    "causal_conv1d_qkv_prefill",
+    "causal_conv1d_update_v2",
+    "fused_gdn_gating",
+    "fused_sigmoid_gating_delta_rule_decode",
+    "chunk_gated_delta_rule",
+    "mega_gdn_decode",
+    "mega_gdn_mtp_decode",
+    "mega_gdn_mtp_decode_varlen",
+    "mega_gdn_prefill",
+]
+_runtime_initialized = False
+
+
+def _initialize_runtime() -> None:
+    """Load native-op bindings and publish the NPU semantic API once."""
+
+    global _runtime_initialized
+    if _runtime_initialized:
+        return
+
+    importlib.import_module(f"{__name__}._custom_op")
+    exported: dict[str, Any] = {}
+    for module_name, names in _EXPORTS.items():
+        module = importlib.import_module(f"{__name__}.{module_name}")
+        exported.update((name, getattr(module, name)) for name in names)
+
+    globals().update(exported)
+    _runtime_initialized = True
+
+
+def __getattr__(name: str) -> Any:
+    if name in __all__:
+        raise RuntimeError(
+            "xllm.python.kernels_npu runtime is not initialized; call "
+            "xllm.python.initialize_runtime() after registering native "
+            "torch operators"
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

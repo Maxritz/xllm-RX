@@ -1,0 +1,620 @@
+# Copyright 2026 The xLLM Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Parallel process groups and graph-visible collectives.
+
+All-reduce selects its platform implementation once at import time. The graph
+operators keep communication nodes in a compiled graph rather than splitting
+around them; process-group rendezvous and topology remain shared.
+"""
+
+from __future__ import annotations
+
+import atexit
+import json
+import math
+import socket
+from collections.abc import Sequence
+from datetime import timedelta
+
+import torch
+import torch.distributed as dist
+from torch.distributed import ProcessGroup
+
+from xllm.python.platform import current_platform
+
+
+def _torch_all_gather(input: torch.Tensor, output: torch.Tensor, group: ProcessGroup) -> None:
+    dist.all_gather(list(output.unbind(0)), input, group=group)
+
+
+_all_gather = _torch_all_gather
+_USE_PYTHON_NPU_GROUPS = current_platform.is_npu()
+if _USE_PYTHON_NPU_GROUPS:
+    import torch_npu
+
+    from xllm.python.distributed.npu import all_gather_on_current_stream as _all_gather
+    from xllm.python.distributed.npu import all_reduce_on_current_stream as _all_reduce
+    from xllm.python.distributed.npu import matmul_reduce_scatter_on_current_stream as _matmul_reduce_scatter
+    from xllm.python.distributed.npu import reduce_scatter_on_current_stream as _reduce_scatter
+
+    _cuda_collectives = None
+elif current_platform.is_cuda() or current_platform.is_dcu() or current_platform.is_ilu():
+    from xllm.python.distributed import cuda as _cuda_collectives
+
+    _all_reduce = _cuda_collectives.all_reduce
+else:
+    _cuda_collectives = None
+    _all_reduce = dist.all_reduce
+
+_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dcp", "attn_dp"))
+# ``tp`` and ``moe_tp`` own a contiguous block of global ranks, while ``dp``,
+# ``moe_ep``, ``cp`` and ``dcp`` stride across those blocks. Both layouts follow
+# from how the caller derives a rank within each group, so a group's full
+# membership is determined by its own size and needs no extra information from
+# the caller.
+# ``cp`` strides by the attention TP size: ranks sharing a (dp, tp) slot but
+# holding different sequence shards form one CP group, matching the C++
+# compute_cp_group_ranks layout (rank = dp*cp*tp + cp_rank*tp + tp_rank).
+# ``dcp`` matches ParallelArgs::kv_split_rank when cp_size == 1:
+# rank_in_group = global_rank / (world / dcp_size).
+_CONTIGUOUS_GROUPS = frozenset(("tp", "moe_tp", "layerwise"))
+
+_groups = {}
+_group_ranks = {}
+_stores = {}
+_world_topology = None
+_world_initialized = False
+
+
+def _shutdown_process_groups() -> None:
+    """Release owned groups before torch_npu shuts down the device runtime."""
+    global _world_initialized, _world_topology
+    if not _world_initialized:
+        return
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    _groups.clear()
+    _group_ranks.clear()
+    _stores.clear()
+    _world_topology = None
+    _world_initialized = False
+
+
+def _backend_for(device: torch.device) -> str:
+    if device.type == "cuda":
+        return "nccl"
+    import torch_npu  # noqa: F401
+
+    return "hccl"
+
+
+def _shared_store(host: str, port: int, global_rank: int, global_world_size: int) -> dist.Store:
+    store_key = (host, port)
+    store = _stores.get(store_key)
+    if store is None:
+        store = dist.TCPStore(
+            host,
+            port,
+            global_world_size,
+            global_rank == 0,
+            timedelta(minutes=5),
+            wait_for_workers=False,
+            multi_tenant=True,
+        )
+        _stores[store_key] = store
+    return store
+
+
+def _exchange_world_topology(
+    store: dist.Store,
+    device: torch.device,
+    global_rank: int,
+    global_world_size: int,
+) -> list[dict[str, object]]:
+    device_index = device.index
+    if device.type == "cuda" and device_index is None:
+        device_index = torch.cuda.current_device()
+    local = {"hostname": socket.gethostname(), "device_index": device_index}
+    key_prefix = "xllm/python_collectives/topology/v1"
+    store.set(f"{key_prefix}/{global_rank}", json.dumps(local))
+    return [json.loads(store.get(f"{key_prefix}/{rank}").decode("utf-8")) for rank in range(global_world_size)]
+
+
+def _ensure_world(
+    host: str,
+    port: int,
+    device: torch.device,
+    global_rank: int,
+    global_world_size: int,
+) -> None:
+    """Initialize the default process group covering every rank.
+
+    The parallel groups are subgroups of it. Building them with ``new_group``
+    instead of constructing communicators directly registers them with c10d,
+    which is what lets a group back a symmetric-memory allocation.
+    """
+    global _world_initialized, _world_topology
+    if _world_initialized:
+        return
+    store = _shared_store(host, port, global_rank, global_world_size)
+    dist.init_process_group(
+        backend=_backend_for(device),
+        store=store,
+        rank=global_rank,
+        world_size=global_world_size,
+        timeout=timedelta(minutes=5),
+    )
+    _world_initialized = True
+    if _USE_PYTHON_NPU_GROUPS:
+        # Registered after torch_npu's hook, so communicators and our cached
+        # references are released while the NPU runtime is still alive.
+        atexit.register(_shutdown_process_groups)
+    # Attention-DP weight shards use one full-world group for the final
+    # reduction.  It is the default process group, so no second communicator
+    # is created and the group is available even when no explicit subgroup is
+    # initialized by the runtime bridge.
+    world_key = ("attn_dp", str(device))
+    _groups[world_key] = dist.group.WORLD
+    _group_ranks[world_key] = tuple(range(global_world_size))
+    _world_topology = _exchange_world_topology(store, device, global_rank, global_world_size)
+
+
+def _group_memberships(group_name: str, world_size: int, global_world_size: int) -> list[list[int]]:
+    """Every group of this kind, in an order all ranks agree on.
+
+    ``new_group`` is collective over the whole world, so each rank has to create
+    all groups of a kind in the same order, not only the one it belongs to.
+    """
+    if world_size <= 0 or global_world_size % world_size:
+        raise ValueError(f"{group_name} size {world_size} does not divide the world size {global_world_size}")
+    if group_name == "attn_dp":
+        if world_size != global_world_size:
+            raise ValueError("attn_dp must cover the full process world")
+        return [list(range(global_world_size))]
+    count = global_world_size // world_size
+    if group_name in _CONTIGUOUS_GROUPS:
+        return [[index * world_size + offset for offset in range(world_size)] for index in range(count)]
+    return [[index + offset * count for offset in range(world_size)] for index in range(count)]
+
+
+def init_process_group(
+    group_name: str,
+    host: str,
+    port: int,
+    rank: int,
+    world_size: int,
+    device: str,
+    global_rank: int,
+    global_world_size: int,
+    group_index: int,
+) -> ProcessGroup:
+    if group_name not in _GROUP_NAMES:
+        raise ValueError(f"unsupported parallel group: {group_name}")
+    if group_name == "attn_dp" and (
+        world_size <= 0 or world_size != global_world_size or rank != global_rank or group_index != 0
+    ):
+        raise ValueError("attn_dp must use the full process world and global rank")
+    device_obj = torch.device(device)
+    group_key = (group_name, str(device_obj))
+    group = _groups.get(group_key)
+    if group is not None:
+        if group.rank() != rank or group.size() != world_size:
+            raise RuntimeError(
+                f"{group_name} group for {group_key[1]} is already initialized as "
+                f"rank {group.rank()}/{group.size()}, requested "
+                f"rank {rank}/{world_size}"
+            )
+        return group
+
+    _ensure_world(host, port, device_obj, global_rank, global_world_size)
+    if group_name == "attn_dp":
+        return _groups[group_key]
+    backend = _backend_for(device_obj)
+
+    own = None
+    own_ranks = None
+    memberships = _group_memberships(group_name, world_size, global_world_size)
+    for index, ranks in enumerate(memberships):
+        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=5), backend=backend)
+        if global_rank in ranks:
+            own = candidate
+            own_index = index
+            own_ranks = ranks
+    if own is None or own.rank() != rank:
+        raise RuntimeError(
+            f"derived {group_name} membership disagrees with the caller: global "
+            f"rank {global_rank} of {global_world_size} expected rank {rank} of "
+            f"{world_size}, got {None if own is None else own.rank()}"
+        )
+    if own_index != group_index:
+        raise RuntimeError(f"derived {group_name} group index {own_index} does not match the caller's {group_index}")
+
+    assert own_ranks is not None
+    _groups[group_key] = own
+    _group_ranks[group_key] = tuple(own_ranks)
+    if _cuda_collectives is not None:
+        _cuda_collectives.init_group(own, device_obj, own_ranks, _world_topology)
+    return own
+
+
+def init_tp_group(
+    host: str,
+    port: int,
+    rank: int,
+    world_size: int,
+    device: str,
+    global_rank: int,
+    global_world_size: int,
+    group_index: int,
+) -> ProcessGroup:
+    return init_process_group(
+        "tp",
+        host,
+        port,
+        rank,
+        world_size,
+        device,
+        global_rank,
+        global_world_size,
+        group_index,
+    )
+
+
+def _require_group(x: torch.Tensor, group_name: str) -> ProcessGroup:
+    group = _groups.get((group_name, str(x.device)))
+    if group is None:
+        raise RuntimeError(f"{group_name} collective called before its process group was initialized for {x.device}")
+    return group
+
+
+def tp_rank(device: torch.device | str) -> int:
+    """Rank in the TP group for ``device`` (0 when no TP group exists)."""
+    group = _groups.get(("tp", str(torch.device(device))))
+    return group.rank() if group is not None else 0
+
+
+def cp_rank(device: torch.device | str) -> int:
+    """Rank in the CP group for ``device`` (0 when no CP group exists)."""
+    group = _groups.get(("cp", str(torch.device(device))))
+    return group.rank() if group is not None else 0
+
+
+def cp_world_size(device: torch.device | str) -> int:
+    """Size of the CP group for ``device`` (1 when no CP group exists)."""
+    group = _groups.get(("cp", str(torch.device(device))))
+    return group.size() if group is not None else 1
+
+
+def layerwise_rank(device: torch.device | str) -> int:
+    """Rank in the layerwise split group, or zero when disabled."""
+    group = _groups.get(("layerwise", str(torch.device(device))))
+    return group.rank() if group is not None else 0
+
+
+def _native_runtime_op(name: str, x: torch.Tensor, group_name: str) -> object | None:
+    """Use a model's explicitly initialized Python NPU group when present.
+
+    Native-only group configurations still use the embedded runtime bridge.
+    Selection precedes execution; errors in either implementation propagate.
+    """
+    if _USE_PYTHON_NPU_GROUPS and (group_name, str(x.device)) in _groups:
+        return None
+    try:
+        import xllm_runtime
+    except ImportError:
+        return None
+    return getattr(xllm_runtime, name, None)
+
+
+def tp_all_reduce(x: torch.Tensor) -> None:
+    op = _native_runtime_op("tp_all_reduce", x, "tp")
+    if op is not None:
+        op(x)
+        return
+    all_reduce_(x, "tp")
+
+
+def tp_all_gather(x: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
+    op = _native_runtime_op("tp_all_gather", x, "tp")
+    if op is not None:
+        return op(x, dim)
+    return all_gather(x, dim, world_size, "tp")
+
+
+def dp_all_gather(
+    x: torch.Tensor,
+    token_counts: list[int],
+    rank: int,
+) -> torch.Tensor:
+    op = _native_runtime_op("dp_all_gather", x, "dp")
+    if op is not None:
+        return op(x, token_counts)
+    if all(count == token_counts[0] for count in token_counts):
+        return all_gather(
+            x,
+            dim=0,
+            world_size=len(token_counts),
+            group_name="dp",
+        )
+    return all_gather_variable(x, token_counts, rank, "dp")
+
+
+def moe_tp_all_reduce(x: torch.Tensor) -> None:
+    op = _native_runtime_op("moe_tp_all_reduce", x, "moe_tp")
+    if op is not None:
+        op(x)
+        return
+    all_reduce_(x, "moe_tp")
+
+
+def moe_ep_all_reduce(x: torch.Tensor) -> None:
+    op = _native_runtime_op("moe_ep_all_reduce", x, "moe_ep")
+    if op is not None:
+        op(x)
+        return
+    all_reduce_(x, "moe_ep")
+
+
+def dcp_group(device: torch.device | str) -> ProcessGroup | None:
+    return _groups.get(("dcp", str(torch.device(device))))
+
+
+@torch.library.custom_op("xllm_ops::all_reduce_", mutates_args={"x"})
+def all_reduce_(x: torch.Tensor, group_name: str = "tp") -> None:
+    group = _require_group(x, group_name)
+    _all_reduce(x, group=group)
+
+
+@torch.library.custom_op("xllm_ops::broadcast_", mutates_args={"x"})
+def broadcast_(x: torch.Tensor, src: int, group_name: str = "tp") -> None:
+    group = _require_group(x, group_name)
+    if not 0 <= src < group.size():
+        raise RuntimeError(f"invalid {group_name} source rank {src}")
+    ranks = _group_ranks.get((group_name, str(x.device)))
+    if ranks is None:
+        raise RuntimeError(f"{group_name} group rank map is unavailable")
+    dist.broadcast(x, src=ranks[src], group=group)
+
+
+@broadcast_.register_fake
+def _(x: torch.Tensor, src: int, group_name: str = "tp") -> None:
+    del src, group_name
+    return None
+
+
+@all_reduce_.register_fake
+def _(x: torch.Tensor, group_name: str = "tp") -> None:
+    return None
+
+
+def _normalize_gather_dim(x: torch.Tensor, dim: int) -> int:
+    if not -x.ndim <= dim < x.ndim:
+        raise IndexError(f"all-gather dimension {dim} out of range for {x.ndim}-D input")
+    return dim + x.ndim if dim < 0 else dim
+
+
+@torch.library.custom_op("xllm_ops::reduce_scatter", mutates_args=())
+def reduce_scatter(x: torch.Tensor, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    """SUM and scatter equal contiguous token blocks in group-rank order."""
+    group = _require_group(x, group_name)
+    if group.size() != world_size or x.ndim == 0 or x.shape[0] % world_size:
+        raise ValueError("reduce-scatter requires matching group size and divisible token rows")
+    input = _contiguous_gather_input(x)
+    output = input.new_empty((input.shape[0] // world_size, *input.shape[1:]))
+    if _USE_PYTHON_NPU_GROUPS:
+        _reduce_scatter(input, output, group)
+    else:
+        dist.reduce_scatter_tensor(output, input, group=group)
+    return output
+
+
+@reduce_scatter.register_fake
+def _(x: torch.Tensor, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    return x.new_empty((x.shape[0] // world_size, *x.shape[1:]))
+
+
+@torch.library.custom_op("xllm_ops::matmul_reduce_scatter", mutates_args=())
+def matmul_reduce_scatter(
+    x: torch.Tensor, weight: torch.Tensor, world_size: int, comm_mode: str = "aiv", group_name: str = "tp"
+) -> torch.Tensor:
+    """Fused NPU matmul and SUM scatter of equal token blocks."""
+    if not _USE_PYTHON_NPU_GROUPS or x.device.type != "npu":
+        raise RuntimeError("fused matmul-reduce-scatter requires an initialized Python NPU group")
+    group = _require_group(x, group_name)
+    if world_size not in (2, 4, 8) or group.size() != world_size:
+        raise ValueError("MMRS requires a matching TP group of size 2, 4, or 8")
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[0] == 0 or x.shape[0] % world_size:
+        raise ValueError("MMRS requires two-dimensional matrices and nonempty divisible token rows")
+    if x.shape[1] != weight.shape[0] or not 256 <= x.shape[1] < 65535 or weight.shape[1] == 0:
+        raise ValueError("MMRS requires matching K in [256, 65535) and a positive output width")
+    if x.dtype not in (torch.float16, torch.bfloat16) or weight.dtype != x.dtype or weight.device != x.device:
+        raise ValueError("MMRS requires matching FP16/BF16 operands on one NPU")
+    if comm_mode not in ("aiv", "ai_cpu", "none", ""):
+        raise ValueError("MMRS communication mode must be aiv, ai_cpu, or none")
+    # Preserve the weight's transpose view; materializing it each step would
+    # add a full weight copy to the prefill path.
+    output = _matmul_reduce_scatter(_contiguous_gather_input(x), weight, group, comm_mode)
+    if (
+        output.shape != (x.shape[0] // world_size, weight.shape[1])
+        or output.dtype != x.dtype
+        or output.device != x.device
+    ):
+        raise RuntimeError("MMRS returned an unexpected output shape, dtype, or device")
+    return output
+
+
+@matmul_reduce_scatter.register_fake
+def _(
+    x: torch.Tensor, weight: torch.Tensor, world_size: int, comm_mode: str = "aiv", group_name: str = "tp"
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0] // world_size, weight.shape[1]))
+
+
+def _contiguous_gather_input(x: torch.Tensor) -> torch.Tensor:
+    """Prepare logical tensor values for the ND all-gather transport."""
+    contiguous = x.contiguous()
+    if contiguous.device.type == "npu" and torch_npu.get_npu_format(contiguous) != torch_npu.Format.ND:
+        # RoPE can leave an NCHW-backed view even after squeezing it to TND.
+        # contiguous() alone does not change that storage descriptor. Keep the
+        # explicit NZ byte-gather API separate from this logical-value gather.
+        contiguous = torch_npu.npu_format_cast(contiguous, torch_npu.Format.ND)
+    return contiguous
+
+
+@torch.library.custom_op("xllm_ops::all_gather", mutates_args=())
+def all_gather(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    group = _require_group(x, group_name)
+    if group.size() != world_size:
+        raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
+    dim = _normalize_gather_dim(x, dim)
+    input = _contiguous_gather_input(x)
+    # HCCL receives a flat ND buffer; adding rank to a 3-D shape can select NCHW storage.
+    gathered = input.new_empty((world_size * input.numel(),)).view(world_size, *input.shape)
+    _all_gather(input, gathered, group=group)
+    if math.prod(x.shape[:dim]) == 1:
+        # Rank-major storage already has concatenation order for this layout.
+        shape = list(x.shape)
+        shape[dim] *= world_size
+        return gathered.view(shape)
+    return torch.cat(gathered.unbind(0), dim=dim)
+
+
+@all_gather.register_fake
+def _(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    dim = _normalize_gather_dim(x, dim)
+    shape = list(x.shape)
+    shape[dim] *= world_size
+    return x.new_empty(shape)
+
+
+@torch.library.custom_op("xllm_ops::all_gather_variable", mutates_args=())
+def all_gather_variable(
+    x: torch.Tensor,
+    token_counts: list[int],
+    rank: int,
+    group_name: str,
+) -> torch.Tensor:
+    group = _require_group(x, group_name)
+    if group.size() != len(token_counts):
+        raise RuntimeError(
+            f"{group_name} size mismatch: group has {group.size()} ranks, "
+            f"but token_counts has {len(token_counts)} entries"
+        )
+    if not 0 <= rank < len(token_counts):
+        raise RuntimeError(f"invalid {group_name} rank {rank}")
+
+    local_tokens = token_counts[rank]
+    if local_tokens < 0 or local_tokens > x.shape[0]:
+        raise RuntimeError(f"invalid local token count {local_tokens} for input with {x.shape[0]} rows")
+    padded_tokens = max(max(token_counts, default=0), 1)
+    padded_shape = list(x.shape)
+    padded_shape[0] = padded_tokens
+    padded = x.new_zeros(padded_shape)
+    if local_tokens:
+        padded[:local_tokens].copy_(x[:local_tokens])
+
+    padded = _contiguous_gather_input(padded)
+    gathered = padded.new_empty((len(token_counts) * padded.numel(),)).view(len(token_counts), *padded.shape)
+    _all_gather(padded, gathered, group=group)
+    valid_chunks = [chunk[:count] for chunk, count in zip(gathered.unbind(0), token_counts) if count]
+    if not valid_chunks:
+        empty_shape = list(x.shape)
+        empty_shape[0] = 0
+        return x.new_empty(empty_shape)
+    return torch.cat(valid_chunks, dim=0)
+
+
+@all_gather_variable.register_fake
+def _(
+    x: torch.Tensor,
+    token_counts: list[int],
+    rank: int,
+    group_name: str,
+) -> torch.Tensor:
+    del rank, group_name
+    shape = list(x.shape)
+    shape[0] = sum(token_counts)
+    return x.new_empty(shape)
+
+
+def _check_collective_buffers(output: torch.Tensor, input: torch.Tensor) -> None:
+    if output.device != input.device or output.dtype != input.dtype:
+        raise ValueError("collective buffers must have the same device and dtype")
+    if not output.is_contiguous() or not input.is_contiguous():
+        raise ValueError("collective buffers must be contiguous")
+
+
+@torch.library.custom_op("xllm_ops::all_to_all_single", mutates_args={"output"})
+def all_to_all_single(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    group_name: str = "tp",
+) -> None:
+    """Exchange equal first-dimension chunks among ranks in ``group_name``."""
+    group = _require_group(input, group_name)
+    if input.ndim == 0 or output.shape != input.shape or input.shape[0] % group.size():
+        raise ValueError(
+            f"{group_name} all-to-all requires equal shapes and a divisible first dimension, "
+            f"got input={tuple(input.shape)}, output={tuple(output.shape)}, world_size={group.size()}"
+        )
+    _check_collective_buffers(output, input)
+    dist.all_to_all_single(output, input, group=group)
+
+
+@all_to_all_single.register_fake
+def _(output: torch.Tensor, input: torch.Tensor, group_name: str = "tp") -> None:
+    del output, input, group_name
+
+
+def gather_dp_execution_tokens(
+    x: torch.Tensor,
+    execution_token_counts: Sequence[int],
+    rank: int,
+) -> tuple[torch.Tensor, int]:
+    """Gather the execution rows materialized by every DP rank."""
+    counts = [int(count) for count in execution_token_counts]
+    if not counts:
+        return x, 0
+    if any(count <= 0 for count in counts):
+        raise RuntimeError(f"DP execution token counts must be positive, got {counts}")
+    if not 0 <= rank < len(counts):
+        raise RuntimeError(f"invalid DP rank {rank} for token counts {counts}")
+    if counts[rank] != x.shape[0]:
+        raise RuntimeError(
+            "DP execution token count does not match the local tensor: "
+            f"rank={rank}, rows={x.shape[0]}, token_counts={counts}"
+        )
+
+    return dp_all_gather(x, counts, rank), sum(counts[:rank])
+
+
+__all__ = [
+    "init_process_group",
+    "init_tp_group",
+    "tp_rank",
+    "cp_rank",
+    "cp_world_size",
+    "layerwise_rank",
+    "dcp_group",
+    "all_reduce_",
+    "reduce_scatter",
+    "matmul_reduce_scatter",
+    "broadcast_",
+    "all_gather",
+    "all_gather_variable",
+    "all_to_all_single",
+    "dp_all_gather",
+    "gather_dp_execution_tokens",
+]

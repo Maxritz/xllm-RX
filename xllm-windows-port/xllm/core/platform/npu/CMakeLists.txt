@@ -1,0 +1,44 @@
+include(cc_library)
+
+cc_library(
+  NAME
+    npu_startup
+  HDRS
+    startup.h
+    native_host_path.h
+    vendor_paths.h
+  SRCS
+    startup.cpp
+  DEPS
+    :config
+    :platform
+    absl::strings
+    ascendcl
+    glog::glog
+    pybind11::embed
+    ${CMAKE_DL_LIBS}
+)
+
+cc_library(
+  NAME 
+    platform_npu
+  HDRS
+    npu_layer_synchronizer.h
+    npu_batch_memcpy.h
+    device_capture_lock.h
+    acl_graph_task_update_context.h
+    npu_profiler.h
+    npu_torch_profiler.h
+  SRCS
+    npu_layer_synchronizer.cpp
+    npu_batch_memcpy.cpp
+    npu_profiler.cpp
+    npu_torch_profiler.cpp
+  DEPS
+    torch_npu
+    glog::glog
+    torch
+    ascendcl
+    msprofiler
+    pybind11::embed
+)

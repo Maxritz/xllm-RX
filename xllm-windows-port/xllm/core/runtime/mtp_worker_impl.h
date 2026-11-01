@@ -1,0 +1,347 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <vector>
+
+#include "core/framework/speculative/embedding_cache.h"
+#include "core/framework/speculative/mtp_async_state.h"
+#include "core/framework/speculative/mtp_json_object_state.h"
+#include "runtime/draft_model_spec_worker_impl.h"
+
+namespace xllm {
+
+#if defined(USE_NPU)
+namespace detail {
+class NpuJsonDraftTokenHandoff;
+}  // namespace detail
+#endif
+
+// MTP (Multi-Token Prediction) speculative worker.
+// Uses a draft model to generate proposals, then validates with target model.
+// Eagle3WorkerImpl inherits from this class.
+template <typename TargetInput>
+class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
+ public:
+  MTPWorkerImpl(const ParallelArgs& parallel_args,
+                const torch::Device& device,
+                const runtime::Options& options,
+                WorkerType worker_type);
+
+  ~MTPWorkerImpl() override;
+
+ protected:
+  // For derived classes (e.g. Eagle3WorkerImpl) that need custom options for
+  // target and draft models. `options` is passed to WorkerImpl (preserves
+  // enable_schedule_overlap etc.), `target_options` / `draft_options` are used
+  // to create the respective workers.
+  MTPWorkerImpl(const ParallelArgs& parallel_args,
+                const torch::Device& device,
+                const runtime::Options& options,
+                const runtime::Options& target_options,
+                const runtime::Options& draft_options,
+                WorkerType worker_type);
+
+ public:
+  bool init_model(const std::string& model_weights_path,
+                  int32_t random_seed,
+                  MasterStatus master_status) override;
+
+  ::xllm::Status create_task_pipeline(
+      std::unique_ptr<TaskExecutionPipeline>& output) override;
+  bool uses_worker_task_pipeline() const override {
+    return std::is_same_v<TargetInput, VlmForwardInput>;
+  }
+
+  std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override;
+
+ protected:
+  using typename DraftModelSpecWorkerImpl<TargetInput>::TargetModelParams;
+  using DraftModelSpecWorkerImpl<TargetInput>::compute_stream_;
+  using DraftModelSpecWorkerImpl<TargetInput>::context_;
+  using DraftModelSpecWorkerImpl<TargetInput>::device_;
+  using DraftModelSpecWorkerImpl<TargetInput>::draft_impl_;
+  using DraftModelSpecWorkerImpl<TargetInput>::is_probabilistic_draft_;
+  using DraftModelSpecWorkerImpl<TargetInput>::dtype_;
+  using DraftModelSpecWorkerImpl<TargetInput>::embedding_cache_;
+  using DraftModelSpecWorkerImpl<TargetInput>::impl_;
+  using DraftModelSpecWorkerImpl<TargetInput>::options_;
+  using DraftModelSpecWorkerImpl<TargetInput>::parallel_args_;
+  using DraftModelSpecWorkerImpl<TargetInput>::prepare_stream_;
+  using DraftModelSpecWorkerImpl<TargetInput>::threadpool_;
+  using DraftModelSpecWorkerImpl<TargetInput>::build_draft_kv_cache_shape;
+  using DraftModelSpecWorkerImpl<TargetInput>::enable_schedule_overlap;
+  using DraftModelSpecWorkerImpl<
+      TargetInput>::estimate_kv_cache_capacity_with_draft;
+  using DraftModelSpecWorkerImpl<TargetInput>::get_optimization_config;
+  using DraftModelSpecWorkerImpl<TargetInput>::prepare_draft_input;
+
+  // MTP composite: leaves own model-specific NPU input preparation.
+  bool owns_npu_parallel_input_prepare() const override;
+
+  std::optional<ForwardOutput> step_prefill(const TargetInput& input) override;
+  std::optional<ForwardOutput> step_decode(const TargetInput& inputs) override;
+  std::optional<ForwardOutput> step_empty(const TargetInput& inputs) override;
+
+  void fill_validate_input_from_draft_outputs(
+      const TargetInput& input,
+      const std::vector<ForwardOutput>& draft_outputs,
+      TargetInput& validate_input,
+      int32_t num_val_tokens,
+      const detail::JsonDraftValidationScratch* json_scratch,
+      Stream& compute_stream);
+  std::optional<ForwardOutput> run_validate(
+      const TargetInput& input,
+      const std::vector<ForwardOutput>& draft_outputs,
+      TargetInput& validate_input,
+      int32_t num_speculative_tokens,
+      const detail::JsonDraftValidationScratch* json_scratch);
+
+  // By value: run_validate owns its copy (JSON bitmask lift) and moves it to
+  // the rejection sampler's sink.
+  virtual SampleOutput validate(SamplingParameters sampling_params,
+                                const std::vector<ForwardOutput>& draft_outputs,
+                                const ForwardOutput& target_output,
+                                int32_t num_speculative_tokens,
+                                const std::vector<uint8_t>& invalid_draft);
+
+  // Hook for algorithm-specific draft output post-processing during decode.
+  virtual void process_draft_sample_output(SampleOutput& /*sample_output*/) {}
+
+  virtual void check_draft_input_embedding(const torch::Tensor& /*embedding*/,
+                                           const std::string& /*phase*/) const {
+  }
+  virtual bool share_target_lm_head_with_draft() const { return true; }
+
+  SampleOutput validate(SamplingParameters sampling_params,
+                        const DraftProposal& draft_proposal,
+                        const ForwardOutput& target_output,
+                        int32_t num_speculative_tokens,
+                        const std::vector<uint8_t>& invalid_draft = {});
+
+  // PD separation: placeholder size for empty embedding slot. Default: 1x
+  // hidden_size. Eagle3 overrides to 3 * target_hidden_size.
+  int64_t get_embedding_placeholder_size() const override;
+  KVCacheShape draft_kv_cache_shape(
+      const KVCacheShape& target_kv_cache_shape) const override;
+
+  // prepare inputs for draft model at Prefill phase.
+  void prepare_prefill_inputs(const TargetInput& inputs,
+                              LlmForwardInput& prefill_inputs);
+  bool supports_expanded_spec_verify() const;
+  bool should_use_explicit_spec_verify_replay_update(
+      const TargetInput& input) const;
+  // A DCP block-table entry covers one logical KV page per KV split. All
+  // speculative cache-slot and expanded-attention metadata must use this
+  // logical size rather than the per-rank physical allocator block size.
+  int32_t logical_block_size() const;
+  int64_t spec_verify_block_table_width(
+      const torch::Tensor& block_tables) const;
+  void ensure_spec_verify_control_block_table(TargetModelParams& input_params,
+                                              int64_t num_sequences);
+  // Returns true when validation must use chunked-prefill to avoid the
+  // FlashInfer batch-decode read-before-write race on the bonus token.
+  bool use_chunked_prefill_spec_verify_path() const;
+  bool uses_embedded_eagle3_draft() const;
+  // Multiaxis RoPE positions can include a prompt-dependent offset and do not
+  // identify the corresponding KV cache length.
+  bool positions_are_decoupled_from_kv_length() const;
+  bool uses_step_major_validate_layout() const;
+  void synchronize_embedded_eagle3_forward();
+  template <typename Input>
+  std::optional<ForwardOutput> run_worker_no_sync(WorkerImpl& worker,
+                                                  const Input& input,
+                                                  Input& processed_input);
+  // Prepare target validate input from cached target context.
+  void prepare_validate_inputs(const TargetInput& inputs,
+                               TargetInput& validate_inputs,
+                               bool static_graph_tasks_prepared = false,
+                               bool record_ready_event = true);
+  bool prepare_static_mtp_graph_tasks_before_final_draft(
+      const TargetInput& input);
+
+  // prepare inputs for draft model at Decode phase.
+  void prepare_draft_inputs(const TargetInput& inputs,
+                            LlmForwardInput& draft_inputs,
+                            int32_t position_offset);
+  void update_decode_step_input(
+      TargetInput& input,
+      const std::vector<EmbeddingCache::DecodeState>& last_states) const;
+
+  // Build draft-side input from cached target context at decode step start.
+  void prepare_draft_extend_inputs(
+      const TargetInput& base_input,
+      const std::vector<EmbeddingCache::DecodeState>& last_states,
+      LlmForwardInput& extend_input,
+      bool force_two_rows = false,
+      bool wait_for_compute_stream = true);
+
+  struct PendingTargetContext {
+    uint64_t generation = 0;
+    torch::Tensor accepted_count_host;
+    bool allow_immutable_compact_view = false;
+    std::vector<int32_t> embedding_ids;
+    std::vector<std::string> request_ids;
+    // Both tensors stay on device.  A steady-state overlap step consumes them
+    // by queueing gather/update ops behind rejection sampling on the same
+    // stream.  They are materialized on CPU only when the batch shape/order
+    // changes and the host cache fallback is required.
+    torch::Tensor accepted_tokens;
+    torch::Tensor accepted_tokens_host;
+    torch::Tensor accepted_embeddings;
+    torch::Tensor base_positions;
+    torch::Tensor base_kv_seq_lens;
+    std::vector<size_t> failed_rows;
+    StreamEventPtr ready_event;
+  };
+
+  struct PendingDraftContext {
+    std::vector<int32_t> embedding_ids;
+    std::vector<std::string> request_ids;
+    std::vector<int32_t> dp_global_token_nums;
+    std::vector<int32_t> dp_global_sequence_nums;
+    std::vector<int32_t> raw_dp_global_token_nums;
+    std::vector<uint64_t> dp_global_batch_generations;
+    std::optional<ForwardOutput> output;
+    LlmForwardInput prepared_input;
+  };
+
+  void stage_target_context_write(const TargetInput& input,
+                                  const SampleOutput& validate_output,
+                                  torch::Tensor base_positions,
+                                  torch::Tensor base_kv_seq_lens,
+                                  StreamEventPtr ready_event,
+                                  torch::Tensor accepted_tokens_host,
+                                  std::vector<size_t> failed_rows,
+                                  torch::Tensor accepted_count_host = {},
+                                  bool allow_immutable_compact_view = false);
+  torch::Tensor acquire_accepted_tokens_host_buffer(
+      const torch::Tensor& accepted_tokens);
+  bool pending_target_context_matches(const TargetInput& input) const;
+  bool device_target_context_ready_for_batch(const TargetInput& input) const;
+  void flush_pending_target_context(size_t keep_latest = 0);
+  const PendingTargetContext& latest_pending_target_context() const;
+  torch::Tensor snapshot_pending_target_tokens();
+  void drain_pending_execution() override;
+  void retire_legacy_prelaunch();
+  bool supports_combined_first_draft_execution() const;
+  bool can_use_combined_first_draft() const;
+  bool can_prelaunch_next_first_draft(const TargetInput& input) const;
+  void prepare_first_draft_template(TargetInput& metadata_template,
+                                    LlmForwardInput& combined_input,
+                                    bool wait_for_compute_stream);
+  void enqueue_next_first_draft(const TargetInput& input,
+                                const SampleOutput& validate_output,
+                                const torch::Tensor& base_positions,
+                                const torch::Tensor& base_kv_seq_lens,
+                                LlmForwardInput combined_input);
+  void submit_pending_first_draft(const TargetInput& batch_identity_input,
+                                  LlmForwardInput draft_input);
+  bool pending_draft_context_matches(const TargetInput& input) const;
+
+  bool uses_verifier_conditioned_draft_prefix() const;
+  int32_t draft_prefix_kv_upper_bound(int32_t embedding_id,
+                                      const std::string& request_id,
+                                      int32_t raw_kv_seq_len,
+                                      int32_t row_offset,
+                                      int64_t kv_capacity) const;
+  void prepare_draft_prefix(
+      const TargetInput& input,
+      const std::vector<EmbeddingCache::DecodeState>& bootstrap_states,
+      LlmForwardInput& draft_input);
+  void retain_draft_prefix(const TargetInput& input,
+                           const SampleOutput& validate_output,
+                           const torch::Tensor& base_positions,
+                           const torch::Tensor& base_kv_seq_lens);
+
+  void write_target_context_to_cache(const TargetInput& input,
+                                     const SampleOutput& validate_output,
+                                     int32_t num_speculative_tokens);
+
+ protected:
+  // Rejection sampling produces accepted state on the compute stream.  Keep
+  // that state device-resident so the next overlap task can be fully enqueued
+  // without waiting for target verification to finish.
+  std::deque<PendingTargetContext> pending_target_context_queue_;
+  uint64_t next_pending_target_generation_ = 1;
+  bool execution_drained_ = false;
+  std::vector<torch::Tensor> accepted_tokens_host_pool_;
+  std::vector<int32_t> device_context_ready_embedding_ids_;
+  std::vector<std::string> device_context_ready_request_ids_;
+  // A single persistent pinned destination is sufficient for accepted-token
+  // D2H: the preceding pending target context is always flushed before the
+  // next validation can submit another copy. The pending context holds a view
+  // into this storage until the copy event is synchronized and CPU consumers
+  // have finished reading it.
+  torch::Tensor accepted_tokens_host_buffer_;
+  // Model-managed KV layouts do not publish a primary block table. Expanded
+  // verification still needs a zero-filled host control table, so retain one
+  // pinned allocation and expose a row view for each batch.
+  torch::Tensor spec_verify_control_block_table_buffer_;
+  // Draft step 0 is submitted at the tail of the preceding target validation,
+  // before control returns to the scheduler.  The following scheduler turn
+  // consumes this output and only submits draft steps 1..N-1.
+  PendingDraftContext pending_draft_context_;
+
+  struct DraftPrefixContext {
+    std::string request_id;
+    torch::Tensor tokens;
+    torch::Tensor hidden;
+    torch::Tensor base_position;
+    torch::Tensor base_kv_seq_len;
+    // Host-only capacity bound for all S verifier rows, independent of how
+    // many tokens were accepted. Device lengths remain exact and separate.
+    int32_t host_kv_upper_bound = 0;
+  };
+  // Own the complete verifier prefix across Host cache flushes and scheduler
+  // reorder/retire transitions. A reused embedding slot must match request_id.
+  std::unordered_map<int32_t, DraftPrefixContext> draft_prefix_contexts_;
+
+  // Classified once when the corresponding models are loaded. Decode-path
+  // decisions only read these closed policies.
+  mtp_async::TargetSpecVerifyMode target_spec_verify_mode_ =
+      mtp_async::TargetSpecVerifyMode::GENERIC;
+  mtp_async::CombinedDraftExecutionPath combined_draft_execution_path_ =
+      mtp_async::CombinedDraftExecutionPath::UNSUPPORTED;
+  mtp_async::DraftPrefixPolicy draft_prefix_policy_ =
+      mtp_async::DraftPrefixPolicy::TAIL_REPAIR;
+
+#if defined(USE_NPU)
+  // Stable-address sources consumed by the target ACL graph's leading input
+  // update. The existing H2D preparation overlaps with the final draft, so no
+  // extra graph-external D2D launch is introduced.
+  torch::Tensor spec_verify_attention_host_buffer_;
+  torch::Tensor spec_verify_attention_device_buffer_;
+  uint64_t spec_verify_attention_buffer_capacity_ = 0;
+  std::shared_ptr<int> spec_verify_attention_buffer_owner_ =
+      std::make_shared<int>(0);
+
+  // Stable validate-sampling controls for the common single-sequence greedy
+  // path.  Their values depend on speculative width, not tensor-parallel
+  // topology, and are rebuilt only when that width changes.
+  torch::Tensor mtp_validate_greedy_indices_;
+  std::unique_ptr<detail::NpuJsonDraftTokenHandoff> json_draft_token_handoff_;
+#endif
+};
+}  // namespace xllm

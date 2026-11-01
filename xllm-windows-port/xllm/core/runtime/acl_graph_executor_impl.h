@@ -1,0 +1,318 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <absl/container/flat_hash_map.h>
+#include <acl/acl.h>
+#include <torch/types.h>
+
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <vector>
+
+#include "core/common/macros.h"
+#include "core/framework/model/causal_lm.h"
+#include "core/framework/model/model_params_view.h"
+#include "core/framework/model/rec_model.h"
+#include "core/kv_cache/storage/kv_cache.h"
+#include "core/runtime/acl_graph_persistent_param.h"
+#include "core/runtime/rec_executor_backend.h"
+#include "core/runtime/rec_executor_impl_factory.h"
+#include "core/runtime/rec_graph_input.h"
+#include "executor_impl.h"
+#include "executor_impl_factory.h"
+#include "options.h"
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattributes"
+#endif
+
+#include "acl_graph_bucket_policy.h"
+#include "torch_npu/csrc/core/npu/NPUGraph.h"
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+namespace xllm::npu {
+
+struct AclGraphTaskUpdateContext;
+
+struct StaticGraphTaskSignature {
+  int64_t linear_state_id = 0;
+  int64_t num_accepted_tokens = 0;
+  int64_t query_start_loc_begin = 0;
+  int64_t query_start_loc_end = 0;
+
+  bool operator==(const StaticGraphTaskSignature&) const = default;
+};
+
+inline std::optional<StaticGraphTaskSignature> make_static_graph_task_signature(
+    const ModelParamsView& params) {
+  if (params.parallel.query_start_loc.size() != 2 ||
+      params.embedding.linear_state_ids.size() != 1 ||
+      params.num_accepted_tokens_host.size() != 1) {
+    return std::nullopt;
+  }
+  return StaticGraphTaskSignature{
+      .linear_state_id = params.embedding.linear_state_ids.front(),
+      .num_accepted_tokens = params.num_accepted_tokens_host.front(),
+      .query_start_loc_begin = params.parallel.query_start_loc.front(),
+      .query_start_loc_end = params.parallel.query_start_loc.back(),
+  };
+}
+
+inline StaticGraphTaskSignature make_static_graph_task_signature(
+    const SpecVerifyGraphTaskSignal& signal) {
+  return StaticGraphTaskSignature{
+      .linear_state_id = signal.linear_state_id,
+      .num_accepted_tokens = signal.num_accepted_tokens,
+      .query_start_loc_begin = 0,
+      .query_start_loc_end = signal.spec_width,
+  };
+}
+
+// ACL graph executor using libtorch NPUGraph for memory management
+// NPUGraph provides mempool to manage temporary tensors during forward pass
+class AclGraph {
+ public:
+  AclGraph(GraphPersistentParam& persistent_param,
+           c10::DeviceIndex device_index,
+           const c10_npu::NPUStream& capture_stream)
+      : persistent_param_(persistent_param), device_index_(device_index) {
+    initialize_streams(device_index, capture_stream);
+  }
+
+  ~AclGraph();
+
+  // Capture computation graph for given bucket num_tokens
+  bool capture(CausalLM* model,
+               const runtime::Options& options,
+               const torch::Tensor& tokens,
+               const torch::Tensor& positions,
+               const ModelParamsView& params,
+               std::vector<KVCache>& kv_cache,
+               uint32_t bucket_num_tokens,
+               c10_npu::MempoolId_t graph_pool);
+
+  bool capture(RecModel* model,
+               const runtime::Options& options,
+               const torch::Tensor& tokens,
+               const torch::Tensor& positions,
+               const RecModelParams& params,
+               std::vector<KVCache>& kv_cache,
+               uint32_t bucket_num_tokens,
+               c10_npu::MempoolId_t graph_pool);
+
+  // Replay captured graph with new input data
+  ModelOutput replay(CausalLM* model,
+                     const torch::Tensor& tokens,
+                     const torch::Tensor& positions,
+                     std::vector<KVCache>& kv_cache,
+                     const ModelParamsView& params);
+
+  ModelOutput replay(RecModel* model,
+                     const torch::Tensor& tokens,
+                     const torch::Tensor& positions,
+                     std::vector<KVCache>& kv_cache,
+                     const RecModelParams& params);
+
+  void prepare_replay_inputs(const torch::Tensor& tokens,
+                             const torch::Tensor& positions,
+                             std::vector<KVCache>& kv_cache,
+                             const ModelParamsView& params);
+
+  bool prepare_static_mtp_graph_tasks(const SpecVerifyGraphTaskSignal& signal,
+                                      const c10_npu::NPUStream& signal_stream);
+
+  torch::Tensor get_hidden_states(uint32_t actual_num_tokens = 0) const {
+    return persistent_param_.hidden_states(actual_num_tokens);
+  }
+
+  c10_npu::MempoolId_t memory_pool() { return graph_.pool(); }
+  int64_t capture_stream_id() const { return capture_stream_->id(); }
+
+  bool rec_bindings_match(const RecModelParams& params) const {
+    return rec_capture_params_.has_value() &&
+           rec_graph_bindings_match(*rec_capture_params_, params);
+  }
+
+ private:
+  // Print graph held tensors for debugging
+  void print_graph_tensors() const;
+
+  // Initialize capture stream if not already initialized
+  void initialize_streams(c10::DeviceIndex device_index,
+                          const c10_npu::NPUStream& capture_stream);
+  void make_graph_wait_for_current_stream(aclrtStream current_stream);
+  void make_current_stream_wait_for_graph(aclrtStream current_stream);
+  void prepare_model_graph_metadata(CausalLM* model,
+                                    const torch::Tensor& positions,
+                                    ModelParamsView& params);
+  void update_spec_verify_attention_tiling(const ModelParamsView& params);
+  bool has_fused_infer_attention_graph_tasks() const;
+
+  bool update_graph_tasks(const ModelParamsView& params,
+                          bool update_causal_conv1d_tasks);
+  void signal_static_causal_conv1d_tasks(
+      const c10_npu::NPUStream& signal_stream);
+  bool static_graph_task_signature_matches(const ModelParamsView& params) const;
+  void capture_static_graph_task_signature(const ModelParamsView& params);
+
+  // Keep native Rec owners alive until captured work has been destroyed.
+  std::optional<RecModelParams> rec_capture_params_;
+
+  // NPUGraph with mempool for managing temporary tensors during forward pass
+  c10_npu::NPUGraph graph_;
+  uint32_t num_tokens_;
+
+  // Reference to persistent parameters (shared across multiple AclGraph
+  // instances)
+  GraphPersistentParam& persistent_param_;
+  std::unique_ptr<ModelGraphMetadataState> model_graph_metadata_state_;
+
+  // Fallback non-default stream for capture when callers are on default stream.
+  std::optional<c10_npu::NPUStream> capture_stream_;
+  aclrtStream graph_stream_ = nullptr;
+  aclrtEvent replay_input_ready_event_ = nullptr;
+  aclrtEvent replay_done_event_ = nullptr;
+  c10::DeviceIndex device_index_;
+  std::shared_ptr<AclGraphTaskUpdateContext> graph_task_context_;
+  std::optional<c10_npu::NPUStream> update_stream_;
+  std::atomic<bool> replay_inputs_prepared_{false};
+  bool first_hybrid_replay_after_capture_ = false;
+  std::optional<StaticGraphTaskSignature> static_graph_task_signature_;
+  std::optional<std::array<const void*, 12>>
+      spec_verify_input_addresses_at_capture_;
+  torch::Tensor graph_paged_attention_tiling_data_;
+  std::optional<kernel::npu::PagedAttentionTilingLayout>
+      spec_verify_paged_attention_tiling_layout_;
+  int64_t spec_verify_block_size_ = 0;
+  int64_t spec_verify_kv_split_core_count_ = 0;
+};
+
+// Executor implementation using ACL graph optimization
+// Uses NPUGraph mempool to reduce memory allocation overhead during inference
+class AclGraphExecutorImpl final : public ExecutorImpl,
+                                   public RecExecutorBackend {
+ public:
+  AclGraphExecutorImpl(CausalLM* model,
+                       const ModelArgs& args,
+                       const torch::Device& device,
+                       const runtime::Options& options);
+
+  AclGraphExecutorImpl(RecModel* model,
+                       const ModelArgs& args,
+                       const torch::Device& device,
+                       const runtime::Options& options);
+
+  ~AclGraphExecutorImpl() override = default;
+
+  // Execute model with graph optimization for decode phase
+  ModelOutput run(const torch::Tensor& tokens,
+                  const torch::Tensor& positions,
+                  std::vector<KVCache>& kv_caches,
+                  const ModelParamsView& params) override;
+
+  ModelOutput run(const torch::Tensor& tokens,
+                  const torch::Tensor& positions,
+                  std::vector<KVCache>& kv_caches,
+                  const RecModelParams& params) override;
+
+  void prepare_graph_input(const torch::Tensor& tokens,
+                           const torch::Tensor& positions,
+                           std::vector<KVCache>& kv_caches,
+                           const ModelParamsView& params) override;
+
+  bool prepare_static_mtp_graph_tasks(const SpecVerifyGraphTaskSignal& signal,
+                                      const Stream& signal_stream) override;
+
+  [[nodiscard]] int32_t graph_slot_count_for_test() const {
+    return graph_slot_count_;
+  }
+  [[nodiscard]] bool graph_slot_prepared_for_test(int32_t slot_idx) const {
+    return graph_slots_.at(static_cast<size_t>(slot_idx)).is_prepared;
+  }
+  size_t get_graph_count() const;
+  size_t get_graph_memory_pool_count();
+  size_t get_graph_capture_stream_count() const;
+
+  [[nodiscard]] uint64_t graph_key_for_test(
+      uint32_t bucket_num_tokens,
+      const ModelParamsView& params) const {
+    return get_graph_key(bucket_num_tokens, params);
+  }
+
+ private:
+  // not own
+  CausalLM* model_ = nullptr;
+  RecModel* rec_model_ = nullptr;
+
+  void initialize(bool need_update_attn_mask,
+                  bool is_hybrid_linear_attention,
+                  bool supports_mla_graph_kv_bucketing);
+  template <typename Model, typename Params>
+  ModelOutput run_typed(Model* model,
+                        const torch::Tensor& tokens,
+                        const torch::Tensor& positions,
+                        std::vector<KVCache>& kv_caches,
+                        const Params& params);
+
+  ModelArgs args_;
+  torch::Device device_;
+  runtime::Options options_;
+
+  struct GraphSlot {
+    std::unique_ptr<GraphPersistentParam> persistent_param;
+    c10_npu::MempoolId_t graph_pool{0, 0};
+    std::optional<c10_npu::NPUStream> graph_capture_stream;
+    absl::flat_hash_map<uint64_t, std::shared_ptr<AclGraph>> graphs;
+    std::deque<uint64_t> static_mtp_graph_keys;
+    bool is_prepared = false;
+  };
+  std::array<GraphSlot, 2> graph_slots_;
+  absl::flat_hash_map<uint64_t, uint64_t> spec_verify_attention_plan_classes_;
+  std::vector<PagedAttentionPlanDescriptor>
+      spec_verify_attention_plan_descriptors_;
+  std::mutex graph_slots_mutex_;
+  int32_t graph_slot_count_ = 2;
+  int32_t next_replay_slot_ = 0;
+  int32_t last_started_replay_slot_ = -1;
+
+  // Get bucket num_tokens for given num_tokens
+  // For num_tokens <= 8: use 1, 2, 4, 8
+  // For num_tokens > 8: use multiples of 16
+  uint32_t get_bucket_num_tokens(uint32_t num_tokens) const;
+
+  uint64_t get_graph_key(uint32_t bucket_num_tokens,
+                         const ModelParamsView& params,
+                         uint64_t attention_plan_class = 0) const;
+  uint64_t get_graph_key(uint32_t bucket_num_tokens,
+                         const RecModelParams& params,
+                         uint64_t attention_plan_class = 0) const;
+
+  std::optional<uint64_t> find_spec_verify_attention_plan_class(
+      uint64_t lookup_key);
+};
+REGISTER_EXECUTOR("npu", AclGraphExecutorImpl);
+REGISTER_REC_EXECUTOR("npu", AclGraphExecutorImpl);
+}  // namespace xllm::npu
