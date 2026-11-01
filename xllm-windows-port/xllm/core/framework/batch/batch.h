@@ -1,0 +1,142 @@
+/* Copyright 2025-2026 The xLLM Authors.
+Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <absl/time/clock.h>
+#include <absl/time/time.h>
+#include <torch/types.h>
+
+#include <cstdint>
+#include <limits>
+#include <utility>
+#include <vector>
+
+#include "core/framework/batch/batch_output_action.h"
+#include "core/framework/batch/batch_output_handler.h"
+#include "core/framework/batch/batch_state.h"
+#include "core/framework/request/request.h"
+#include "core/runtime/vlm_forward_params.h"
+
+namespace xllm {
+
+struct ModelArgs;
+
+// LLM/VLM engine-facing batch. Rec uses RecBatch directly.
+class Batch final {
+ public:
+  Batch() = default;
+
+  BatchInputType input_type() const;
+  void reserve(size_t sequence_count, size_t group_count);
+  // Reserve only the number of sequences that carry input embeddings.
+  void reserve(size_t sequence_count,
+               size_t group_count,
+               size_t input_embedding_count);
+
+  explicit Batch(Sequence* sequence);
+  explicit Batch(const std::vector<Sequence*>& sequences);
+
+  void add(Sequence* sequence,
+           uint32_t allowed_max_token = std::numeric_limits<uint32_t>::max());
+
+  void add(const std::vector<Sequence*>& sequences);
+
+  void add(SequencesGroup* sequence_group);
+
+  const std::vector<SequencesGroup*>& sequence_groups() const {
+    return state_.sequence_groups();
+  }
+
+  void update_forward_type(Sequence* sequence);
+
+  void refresh_forward_type();
+
+  void set_swap_block_transfer_infos(
+      std::vector<BlockTransferInfo> swap_block_transfer_infos) {
+    state_.set_swap_block_transfer_infos(std::move(swap_block_transfer_infos));
+  }
+
+  void set_batch_id() { state_.set_batch_id(); }
+
+  uint64_t batch_id() const { return state_.batch_id(); }
+
+  // Logical execution rows.
+  size_t size() const;
+  bool empty() const { return state_.empty(); }
+  size_t num_scheduled_sequences() const {
+    return state_.sequence_plan().size();
+  }
+  size_t num_groups() const { return state_.sequence_groups().size(); }
+  const BatchSequencePlan& sequence_plan() const {
+    return state_.sequence_plan();
+  }
+
+  Sequence* operator[](size_t index) const;
+
+  // prepare forward inputs
+  LlmForwardInput prepare_forward_input(uint32_t num_decoding_tokens,
+                                        uint32_t min_decoding_bach_size,
+                                        const ModelArgs& args,
+                                        int32_t cp_size = 1);
+
+  // Prepare LlmForwardInput for distributed transport.
+  LlmForwardInput prepare_forward_input(const ModelArgs& args,
+                                        ThreadPool* thread_pool,
+                                        int32_t cp_size = 1);
+  VlmForwardInput prepare_vlm_forward_input(uint32_t num_decoding_tokens,
+                                            uint32_t min_decoding_batch_size,
+                                            const ModelArgs& args,
+                                            int32_t cp_size = 1);
+  VlmForwardInput prepare_vlm_forward_input(const ModelArgs& args,
+                                            ThreadPool* thread_pool,
+                                            int32_t cp_size = 1);
+
+  // Apply sampled tokens or reserve/commit a pending overlap result.
+  void process_sample_output(const SampleOutput& sample_output,
+                             BatchOutputAction action,
+                             bool force_requested_beam_result_size = false);
+
+  void process_sample_output(const RawForwardOutput& raw_output,
+                             BatchOutputAction action);
+
+  // process output for beam search kernel
+  void process_beam_search_output(const RawForwardOutput& raw_output,
+                                  BatchOutputAction action);
+
+  // Start a new sequence view after beam expansion. New beam rows have no
+  // scheduler token limit.
+  void refresh_sequences_from_groups();
+
+  const std::vector<uint32_t>& get_allowed_max_tokens() const {
+    return state_.sequence_plan().budgets();
+  }
+
+  std::unordered_map<uint32_t, uint32_t> cal_seq_exchange_index_test(
+      std::vector<uint32_t>& kv_cache_tokens_num) {
+    return BatchState::cal_seq_exchange_index(kv_cache_tokens_num);
+  }
+
+  // Return the current sequence view.
+  std::vector<Sequence*> get_sequences();
+  std::vector<Sequence*> get_sequences() const;
+
+ private:
+  BatchState state_;
+  BatchOutputHandler output_handler_;
+};
+
+}  // namespace xllm

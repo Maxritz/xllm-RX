@@ -1,0 +1,190 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "eagle3_worker_impl.h"
+
+#include <glog/logging.h>
+
+#include "core/framework/model/aux_hidden_capture.h"
+#include "core/framework/model_loader/model_loader.h"
+#include "core/framework/sampling/logits_processor.h"
+#include "core/util/tensor_helper.h"
+#include "runtime/llm_worker_impl.h"
+
+namespace xllm {
+
+namespace {
+
+runtime::Options eagle3_main_options(const runtime::Options& options) {
+  auto opts = options;
+  opts.enable_schedule_overlap(false)
+      .is_draft_engine(false)
+      .enable_graph_aux_hidden_states(true);
+  return opts;
+}
+
+runtime::Options eagle3_draft_options(const runtime::Options& options) {
+  auto opts = options;
+  opts.enable_schedule_overlap(false)
+      .is_draft_engine(true)
+      .num_decoding_tokens(1)
+      .num_speculative_tokens(0)
+      .enable_graph(false)
+      .enable_graph_mode_decode_no_padding(false)
+      .enable_prefill_piecewise_graph(false)
+      .enable_graph_aux_hidden_states(true)
+      .backend("llm");
+  return opts;
+}
+
+}  // namespace
+
+template <typename TargetInput>
+Eagle3WorkerImpl<TargetInput>::Eagle3WorkerImpl(
+    const ParallelArgs& parallel_args,
+    const torch::Device& device,
+    const runtime::Options& options,
+    WorkerType worker_type)
+    : MTPWorkerImpl<TargetInput>(parallel_args,
+                                 device,
+                                 options,
+                                 eagle3_main_options(options),
+                                 eagle3_draft_options(options),
+                                 worker_type) {
+  // Context parallelism does not expose the auxiliary hidden states.
+  CHECK_LE(parallel_args.cp_size(), 1)
+      << "EAGLE-3 speculative decoding does not support context parallelism "
+         "(cp_size > 1).";
+}
+
+template <typename TargetInput>
+Eagle3WorkerImpl<TargetInput>::~Eagle3WorkerImpl() {
+  this->drain_pending_execution();
+}
+
+template <typename TargetInput>
+bool Eagle3WorkerImpl<TargetInput>::init_model(
+    const std::string& model_weights_path,
+    int32_t random_seed,
+    MasterStatus master_status) {
+  // Call parent's init_model first
+  bool result = MTPWorkerImpl<TargetInput>::init_model(
+      model_weights_path, random_seed, master_status);
+
+  // Load hot_token_id_ directly from state_dict (EAGLE-3 specific)
+  // This should be done after draft model is loaded
+  if (draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
+    use_draft_token_mapping_ = !uses_embedded_eagle3_draft();
+    if (!use_draft_token_mapping_) {
+      hot_token_id_ = torch::Tensor();
+      return result;
+    }
+
+    // d2t stores diffs between draft id and target id
+    // hot_token_id = d2t + arange(d2t.size(0))
+    auto model_loader = ModelLoader::create(model_weights_path);
+    auto& state_dicts = model_loader->get_state_dicts();
+    for (const auto& state_dict : state_dicts) {
+      torch::Tensor d2t_tensor = state_dict->get_tensor("d2t");
+      if (d2t_tensor.defined()) {
+        auto arange_tensor = torch::arange(d2t_tensor.size(0));
+        hot_token_id_ = (d2t_tensor + arange_tensor).to(device_, torch::kLong);
+        LOG(INFO) << "Eagle3WorkerImpl: Loaded d2t tensor from state_dict, "
+                     "hot_token_id size: "
+                  << hot_token_id_.size(0);
+        break;
+      }
+    }
+  }
+
+  return result;
+}
+
+template <typename TargetInput>
+int64_t Eagle3WorkerImpl<TargetInput>::get_embedding_placeholder_size() const {
+  return AuxHiddenCapture::aux_hidden_dim(context_.get_model_args());
+}
+
+template <typename TargetInput>
+void Eagle3WorkerImpl<TargetInput>::process_draft_sample_output(
+    SampleOutput& sample_output) {
+  // EAGLE-3 specific: map draft token IDs to target token IDs.
+  if (!use_draft_token_mapping_ || !hot_token_id_.defined() ||
+      !sample_output.next_tokens.defined() ||
+      sample_output.next_tokens.numel() == 0) {
+    return;
+  }
+
+  // Scatter q over the target vocab so the (p-q)+ residual keeps full
+  // target mass where the draft cannot propose (q=0).
+  if (sample_output.draft_logits.defined()) {
+    const int64_t num_draft_rows = sample_output.draft_logits.size(0);
+    torch::Tensor dense =
+        torch::full({num_draft_rows, context_.get_model_args().vocab_size()},
+                    -std::numeric_limits<float>::infinity(),
+                    sample_output.draft_logits.options());
+    dense.scatter_(
+        /*dim=*/1,
+        hot_token_id_.view({1, -1}).expand(
+            {num_draft_rows, hot_token_id_.size(0)}),
+        sample_output.draft_logits);
+    sample_output.draft_logits = dense;
+  }
+
+  sample_output.next_tokens =
+      hot_token_id_.index_select(0, sample_output.next_tokens);
+}
+
+template <typename TargetInput>
+void Eagle3WorkerImpl<TargetInput>::check_draft_input_embedding(
+    const torch::Tensor& embedding,
+    const std::string& phase) const {
+  if (!embedding.defined()) {
+    CHECK_NE(phase, "prefill")
+        << "Eagle3 prefill requires verifier aux hidden-state embeddings. "
+        << "Check that the target model captures its aux hidden-state layers.";
+    return;
+  }
+
+  const int64_t expected_hidden_size = get_embedding_placeholder_size();
+  const int64_t draft_hidden_size =
+      draft_impl_ == nullptr ? 0 : draft_impl_->hidden_size();
+  CHECK_EQ(embedding.dim(), 2)
+      << "Eagle3 " << phase << " embedding must be a 2-D tensor, got dim "
+      << embedding.dim();
+  CHECK_GT(embedding.size(0), 0)
+      << "Eagle3 " << phase << " embedding must contain at least one row.";
+  if (phase == "decode") {
+    CHECK(embedding.size(-1) == expected_hidden_size ||
+          embedding.size(-1) == draft_hidden_size)
+        << "Eagle3 " << phase
+        << " embedding hidden size mismatch, expected target aux hidden size "
+        << expected_hidden_size << " or draft hidden size " << draft_hidden_size
+        << ", got " << embedding.size(-1);
+    return;
+  }
+
+  CHECK_EQ(embedding.size(-1), expected_hidden_size)
+      << "Eagle3 " << phase
+      << " embedding hidden size mismatch, expected target aux hidden size "
+      << expected_hidden_size << ", got " << embedding.size(-1)
+      << ". Check that the target model captures its aux hidden-state layers "
+         "for Eagle3.";
+}
+
+template class Eagle3WorkerImpl<LlmForwardInput>;
+template class Eagle3WorkerImpl<VlmForwardInput>;
+
+}  // namespace xllm

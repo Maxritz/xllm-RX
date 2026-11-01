@@ -1,0 +1,432 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "llm_worker_impl.h"
+
+#include <c10/core/StreamGuard.h>
+#include <glog/logging.h>
+#include <torch/torch.h>
+
+#include <memory>
+#include <optional>
+#include <utility>
+
+#include "common/device_monitor.h"
+#include "common/metrics.h"
+#include "core/framework/config/beam_search_config.h"
+#include "core/framework/config/eplb_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/eplb/eplb_utils.h"
+#include "core/framework/model/model_args.h"
+#include "core/framework/model/model_params_view.h"
+#include "core/kv_cache/linear_state_restore.h"
+#include "core/kv_cache/transfer/kv_transfer_completion.h"
+#if defined(USE_CUDA) || defined(USE_ILU) || defined(USE_MUSA)
+#include "layers/cuda/flashinfer_workspace.h"
+#endif
+#include "core/framework/sampling/sampler.h"
+#include "core/framework/speculative/draft_extend_input.h"
+#include "models/model_registry.h"
+#include "runtime/executor.h"
+#include "util/env_var.h"
+#include "util/threadpool.h"
+#include "util/timer.h"
+
+namespace xllm {
+
+namespace {
+
+void wait_input_ready_events(const LlmForwardInput& input,
+                             const Stream& stream) {
+  CHECK(stream.wait_event(input.runtime.metadata_ready_event))
+      << "failed to wait LlmForwardInput metadata ready event";
+}
+
+}  // namespace
+
+LLMWorkerImpl::LLMWorkerImpl(const ParallelArgs& parallel_args,
+                             const torch::Device& device,
+                             const runtime::Options& options)
+    : WorkerImpl(parallel_args, device, options) {
+  device_.set_device();
+#if defined(USE_CUDA) || defined(USE_MUSA)
+  const auto& model_config = ModelConfig::get_instance();
+  if (!ModelConfig::is_python_model_impl(model_config.model_impl())) {
+    threadpool_.schedule([this]() mutable {
+      // initialize flashinfer workspace
+      ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance().initialize(
+          device_);
+    });
+  }
+#endif
+}
+
+bool LLMWorkerImpl::init_model(ModelContext& context) {
+  CHECK(model_ == nullptr) << "Model is already initialized.";
+  const auto& model_config = ModelConfig::get_instance();
+#if defined(USE_MUSA)
+  static const bool use_pool_compute_stream = util::get_bool_env(
+      "XLLM_MUSA_POOL_COMPUTE_STREAM", /*default_value=*/true);
+  const bool is_qwen3 = context.get_model_args().model_type() == "qwen3";
+  if (use_pool_compute_stream && !is_qwen3) {
+    compute_stream_ = device_.get_stream_from_pool();
+  } else if (use_pool_compute_stream) {
+    LOG(WARNING) << "MUSA pool compute streams are not validated for Qwen3 "
+                    "attention; using the default compute stream.";
+  }
+
+  const auto& beam_search_config = BeamSearchConfig::get_instance();
+  CHECK(!has_linear_attention_layers(context.get_model_args()) ||
+        (!beam_search_config.enable_beam_search_kernel() &&
+         beam_search_config.beam_width() <= 1))
+      << "MUSA beam search is not supported for models with linear-attention "
+         "layers.";
+#endif
+
+#if defined(USE_CUDA) || defined(USE_MUSA)
+  // Ensure FlashinferWorkspace is initialized on the calling thread before
+  // constructing model layers. When called synchronously from
+  // SpeculativeWorkerImpl (e.g. MTP target/draft setup), init_model runs on
+  // the MTP worker's thread (T_MTP) rather than on the LLMWorkerImpl's own
+  // threadpool thread (T_worker) where the scheduled initialize() runs.
+  // FlashinferWorkspace is thread_local, so T_MTP's instance must be
+  // explicitly initialized here; otherwise FlashInferAttentionImpl captures
+  // an undefined int_workspace_buffer_ and crashes at prefill time.
+  //
+  // Skip when model_impl=python: Python executor uses flashinfer's Python API
+  // directly; initializing the C++ workspace would conflict with Python-side
+  // TVM-FFI type registration.
+  if (!ModelConfig::is_python_model_impl(model_config.model_impl())) {
+    auto& ws = ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance();
+    if (!ws.get_int_workspace_buffer().defined()) {
+      ws.initialize(device_);
+    }
+  }
+#endif
+
+  // Try to create a causal LM model
+  model_ = create_llm_model(context);
+
+  // Dont find model in causal models
+  CHECK(model_ != nullptr) << "Failed to create model.";
+  model_executor_ = std::make_unique<Executor>(
+      model_.get(), context.get_model_args(), device_, options_);
+
+  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
+    const auto& args = context.get_model_args();
+    const auto& parallel_args = context.get_parallel_args();
+    const int32_t num_layers = args.n_layers() - args.first_k_dense_replace();
+    const int32_t eplb_device_num = eplb::effective_device_num(
+        parallel_args.world_size(), parallel_args.ep_size());
+    const int32_t num_device_experts = eplb::local_physical_experts_num(
+        args.n_routed_experts(),
+        eplb_device_num,
+        EPLBConfig::get_instance().redundant_experts_num());
+    // TODO: support virtual memory.
+    expert_load_data_ = torch::zeros(
+        {num_layers, num_device_experts},
+        torch::TensorOptions().dtype(torch::kInt64).device(device_));
+    // MTP draft MoE layers still write to their own load buffer, but only
+    // the target reports loads and consumes EPLB prepare/update commands.
+    if (!is_spec_draft_) {
+      eplb_executor_ = std::make_unique<EplbExecutor>(*model_, device_);
+    }
+  }
+
+  if (::xllm::BeamSearchConfig::get_instance().enable_beam_search_kernel()) {
+    beam_searcher_ = std::make_unique<BeamSearcher>();
+  }
+  return true;
+}
+
+void LLMWorkerImpl::prepare_expert_input(ExpertInput& input) const {
+  if (expert_load_data_.defined()) {
+    // Python/TORCH models also record loads without NPU mapping metadata.
+    input.expert_load_data = expert_load_data_;
+  }
+}
+
+#if defined(USE_NPU)
+bool LLMWorkerImpl::prepare_static_mtp_graph_tasks(
+    const SpecVerifyGraphTaskSignal& signal,
+    const Stream& signal_stream) {
+  if (model_executor_ == nullptr) {
+    return false;
+  }
+  return model_executor_->prepare_static_mtp_graph_tasks(signal, signal_stream);
+}
+#endif
+
+std::optional<ForwardOutput> LLMWorkerImpl::execute_no_sync_on_stream(
+    const LlmForwardInput& input,
+    Stream& compute_stream,
+    ForwardCompletion completion) {
+  const ForwardSyncPolicy sync_policy = ForwardSyncPolicy::NO_SYNC;
+  c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
+  if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
+#if defined(USE_NPU)
+    if (!enable_schedule_overlap() && options_.backend() == "llm") {
+      aclrtStream current_acl_stream =
+          c10_npu::getCurrentNPUStream(device_.index()).stream();
+      atb::Context* atb_context =
+          const_cast<atb::Context*>(context_.get_atb_context());
+      atb_context->SetExecuteStream(current_acl_stream);
+      wait_input_ready_events(input, compute_stream);
+      return step_internal(input, sync_policy, completion);
+    } else {
+      SET_ATB_EXECUTE_STREAM((&compute_stream), device_, context_);
+      wait_input_ready_events(input, compute_stream);
+      return step_internal(input, sync_policy, completion);
+    }
+#else
+    wait_input_ready_events(input, compute_stream);
+    return step_internal(input, sync_policy, completion);
+#endif
+  }
+  wait_input_ready_events(input, compute_stream);
+  return step_internal(input, sync_policy, completion);
+}
+
+std::optional<ForwardOutput> LLMWorkerImpl::step(const LlmForwardInput& input) {
+#if defined(USE_NPU)
+  if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
+    if (!enable_schedule_overlap() && options_.backend() == "llm") {
+      aclrtStream current_stream =
+          c10_npu::getCurrentNPUStream(device_.index()).stream();
+      atb::Context* atb_context =
+          const_cast<atb::Context*>(context_.get_atb_context());
+      atb_context->SetExecuteStream(current_stream);
+    } else {
+      SET_ATB_EXECUTE_STREAM(compute_stream_, device_, context_);
+      wait_input_ready_events(input, *compute_stream_);
+      return step_internal(input, ForwardSyncPolicy::LEGACY);
+    }
+  }
+#endif
+
+  std::unique_ptr<Stream> stream = device_.current_stream();
+  wait_input_ready_events(input, *stream);
+  return step_internal(input, ForwardSyncPolicy::LEGACY);
+}
+
+std::optional<ForwardOutput> LLMWorkerImpl::step_for_schedule_overlap(
+    const LlmForwardInput& input) {
+  prepare_schedule_overlap(input);
+  return execute_no_sync_on_stream(
+      input, *compute_stream_, ForwardCompletion::RECORD_EVENT);
+}
+
+std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
+    const LlmForwardInput& input,
+    ForwardSyncPolicy sync_policy,
+    ForwardCompletion completion) {
+  MULTI_MODEL_STEP_LOCK(
+      ::xllm::LoadConfig::get_instance().enable_vmm_weights());
+
+  Timer timer;
+  auto& sampling_params = input.sampling_params;
+
+  KVTransferCompletion kv_transfers;
+
+  if (options_.kv_cache_transfer_mode() == "PUSH" &&
+      !input.transfer_kv_infos.empty()) {
+#if defined(USE_NPU)
+    std::shared_ptr<NPULayerSynchronizerImpl> layer_synchronizer =
+        std::make_shared<NPULayerSynchronizerImpl>(
+            context_.get_model_args().n_layers());
+#elif defined(USE_MLU)
+    std::shared_ptr<MLULayerSynchronizerImpl> layer_synchronizer =
+        std::make_shared<MLULayerSynchronizerImpl>(
+            context_.get_model_args().n_layers());
+#elif defined(USE_DCU)
+    std::shared_ptr<DCULayerSynchronizerImpl> layer_synchronizer =
+        std::make_shared<DCULayerSynchronizerImpl>(
+            context_.get_model_args().n_layers());
+#endif
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+    input.input_params.parallel.layer_synchronizer = layer_synchronizer;
+
+    kv_transfers.add(
+        kv_cache_transfer_->push_kv_blocks_async(input.transfer_kv_infos,
+                                                 context_.get_parallel_args(),
+                                                 layer_synchronizer,
+                                                 is_spec_draft_));
+#endif
+  }
+  auto wait_kv_push = [&kv_transfers]() {
+    CHECK(kv_transfers.wait()) << "KV cache push failed";
+  };
+  if (eplb_executor_ != nullptr) {
+    eplb_executor_->start_eplb_step(input.input_params.expert.eplb_info);
+  }
+
+  // call model executor forward to get hidden states
+  ModelParamsView execution_params(input.input_params);
+  auto model_output = model_executor_->forward(
+      input.token_ids, input.positions, kv_caches_, execution_params);
+  if (eplb_executor_ != nullptr) {
+    eplb_executor_->finish_eplb_step();
+  }
+  if (!model_output.hidden_states.defined()) {
+    wait_kv_push();
+    return std::nullopt;
+  }
+
+  torch::Tensor logits;
+  torch::Tensor lm_head_selected_token_idxes;
+  torch::Tensor selected_hidden;
+  if (sampling_params.num_sample_seqs() > 0) {
+    torch::Tensor selected_token_idxes = remap_selected_token_idxes_for_lm_head(
+        sampling_params.selected_token_idxes(),
+        execution_params.parallel,
+        model_output.hidden_states);
+    if (model_output.hidden_states.defined() &&
+        selected_token_idxes.device() != model_output.hidden_states.device()) {
+      selected_token_idxes = selected_token_idxes
+                                 .to(model_output.hidden_states.device(),
+                                     /*non_blocking=*/false)
+                                 .contiguous();
+    }
+    lm_head_selected_token_idxes = selected_token_idxes;
+    const bool need_selected_hidden =
+        input.return_selected_hidden ||
+        (options_.cp_size() > 1 && options_.enable_speculative_decode());
+    if (need_selected_hidden) {
+      // Emit both selected hidden and logits from a single lm_head pass so the
+      // ConfidenceHead and CP speculative paths can consume hidden without a
+      // second projection.
+      logits = model_->logits(
+          model_output.hidden_states, selected_token_idxes, selected_hidden);
+      if (!selected_hidden.defined() && model_output.hidden_states.defined()) {
+        // ATB lm_head backend does not expose a second output tensor
+        // (LmHeadParam::outputHidden is false), so we surface the hidden here.
+        // selected_hidden must align row-for-row with `logits`, which is
+        // produced in selected_token_idxes order. index_select reproduces that
+        // order for any selection. We deliberately do NOT alias the full
+        // hidden_states on a numel match: equal row count does not imply the
+        // idxes are the identity permutation, and a full-but-reordered
+        // selection would silently misalign hidden against logits. The gather
+        // is one [num_selected, hidden] copy per decode step (not per layer),
+        // negligible next to the forward.
+        selected_hidden = model_output.hidden_states.index_select(
+            /*dim=*/0, selected_token_idxes.to(torch::kLong));
+      }
+    } else {
+      logits = model_->logits(model_output.hidden_states, selected_token_idxes);
+    }
+  }
+
+  ForwardOutput output;
+  output.mtp_topk_state = std::move(model_output.mtp_topk_state);
+  if (eplb_executor_ != nullptr) {
+    output.expert_load_data = expert_load_data_;
+    output.prepared_token = eplb_executor_->consume_ready_prepare_token();
+  }
+
+  if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
+      !options_.enable_speculative_decode()) {
+    MULTI_MODEL_STEP_UNLOCK();
+    if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
+      wait_kv_push();
+      return std::nullopt;
+    }
+    int ret = device_.synchronize_default_stream();
+    CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
+    wait_kv_push();
+    if (eplb_executor_ != nullptr) {
+      return output;
+    }
+    return std::nullopt;
+  }
+
+  // driver prepare model output
+  if (sampling_params.num_sample_seqs() > 0) {
+    output.selected_hidden = selected_hidden;
+    output.logprobs = sampling_params.logprobs();
+    output.max_top_logprobs = sampling_params.max_top_logprobs();
+    if (!input.skip_sampling_for_logits_only) {
+      auto sample_output = [&]() {
+        if (!sampling_params.min_token_positions().defined()) {
+          return sample(logits, sampling_params);
+        }
+        SamplingParameters target_sampling = sampling_params;
+        const auto selected_positions = input.positions.index_select(
+            /*dim=*/0,
+            sampling_params.selected_token_idxes().to(torch::kInt64));
+        target_sampling.min_tokens_remaining() =
+            sampling_params.min_token_positions() - selected_positions;
+        return sample(logits, target_sampling);
+      }();
+      // beam search kernel
+      BeamSearchOutput beam_search_output;
+      if (sampling_params.use_beam_search() &&
+          sampling_params.acc_logprob().defined() &&
+          sampling_params.acc_logprob().numel() > 0) {
+        beam_search_output =
+            beam_searcher_->forward(sampling_params.acc_logprob(),
+                                    sample_output.top_tokens,
+                                    sample_output.top_logprobs);
+      }
+
+      // set sample output to output
+      output.sample_output = sample_output;
+      // set beam search output to output
+      output.beam_search_output = beam_search_output;
+    }
+    output.logits = logits;
+  }
+
+  if (options_.enable_speculative_decode()) {
+    const bool is_target_prefill =
+        !input.input_params.meta.batch_forward_type.is_decode() &&
+        !is_spec_draft_;
+    output_spec_hidden_states(output.sample_output,
+                              model_output,
+                              lm_head_selected_token_idxes,
+                              selected_hidden,
+                              is_target_prefill,
+                              /*cp_enabled=*/options_.cp_size() > 1);
+  }
+
+  MULTI_MODEL_STEP_UNLOCK();
+  bool should_sync_default_stream = true;
+#if defined(USE_NPU)
+  should_sync_default_stream =
+      !can_skip_npu_graph_decode_sync(input.input_params);
+#endif
+  if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
+    wait_kv_push();
+    finalize_no_sync_output(output, input, completion);
+    return output;
+  }
+  if (should_sync_default_stream) {
+    int ret = device_.synchronize_default_stream();
+    CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
+  }
+
+  wait_kv_push();
+
+  COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
+  if (should_sync_default_stream) {
+    DeviceMonitor::get_instance().update_active_activation_memory(
+        device_.index());
+  }
+
+  return output;
+}
+
+}  // namespace xllm

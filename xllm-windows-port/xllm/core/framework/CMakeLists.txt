@@ -1,0 +1,43 @@
+include(cc_library)
+
+include_directories(.)
+if(USE_NPU)
+  include_directories(
+    ${CMAKE_SOURCE_DIR}/third_party/spdlog/include
+  )
+endif()
+add_subdirectory(batch)
+add_subdirectory(block)
+add_subdirectory(allocator)
+add_subdirectory(config)
+add_subdirectory(chat_template)
+add_subdirectory(constrained)
+add_subdirectory(model)
+add_subdirectory(model_context)
+add_subdirectory(model_loader)
+add_subdirectory(transfer)
+add_subdirectory(parallel_state)
+add_subdirectory(multimodal)
+add_subdirectory(encoder_cache)
+add_subdirectory(state_dict)
+add_subdirectory(quantization)
+add_subdirectory(tokenizer)
+add_subdirectory(sampling)
+add_subdirectory(request)
+add_subdirectory(eplb)
+add_subdirectory(dit_cache)
+add_subdirectory(speculative)
+
+# Manager construction uses the shared VMM allocator backend.
+cc_library(
+  NAME
+    kv_cache_manager_factory
+  HDRS
+    block/kv_cache_manager_factory.h
+  SRCS
+    block/kv_cache_manager_factory.cpp
+  DEPS
+    :block
+    :kv_cache
+    :distributed_virtual_memory_coordinator
+)

@@ -1,0 +1,297 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "core/framework/config/execution_config.h"
+
+#include "core/common/global_flags.h"
+#include "core/framework/config/config_utils.h"
+#include "core/framework/config/speculative_config.h"
+#include "core/platform/platform.h"
+
+DEFINE_string(extension_impl,
+              "",
+              "Native extension implementation family for registered "
+              "components, including models and executors. An empty value "
+              "preserves the normal implementation selection.");
+
+DEFINE_bool(enable_task_pipeline,
+            false,
+            "Enable the task execution pipeline. Uses two slots with "
+            "scheduler overlap and one slot without it. "
+            "Python eager/ACL Graph models with prepared attention metadata; "
+            "Supports DP, or GLM DSA DCP with DP=1 for ordinary/fixed MTP "
+            "decoding. Qwen3.5-family hybrid DFlash2/DSpark uses worker-owned "
+            "fixed-width ACL graphs with DP=1. CP/layerwise split are "
+            "unsupported.");
+
+DEFINE_bool(
+    enable_graph,
+    false,
+    "Whether to enable graph execution for decode phase. When enabled, "
+    "the engine uses graph mode (CUDA Graph for GPU, ACL Graph for NPU, "
+    "MLU Graph, or DCU Graph) to optimize decode performance by reducing "
+    "kernel launch overhead and device idle time.");
+
+DEFINE_bool(
+    enable_unified_mtp_graph,
+    false,
+    "Whether to route supported NPU speculative decode requests through a "
+    "unified Python graph. Supports GLM MTP and task-pipeline "
+    "DFlash/DFlash2/DSpark. "
+    "When disabled, ordinary model graph execution remains unchanged.");
+
+DEFINE_bool(disable_graph_warmup,
+            false,
+            "Whether to skip synthetic graph warmup during engine startup. "
+            "When enabled, graphs are captured lazily by real requests.");
+
+DEFINE_int32(block_draft_graph_warmup_max_kv_len,
+             0,
+             "Pre-capture power-of-two KV capacity buckets for Python block "
+             "draft ACL graphs. 0 covers the full model context; a positive "
+             "value bounds proactive capture while retaining required warmup "
+             "shapes; -1 retains lazy capacity capture. "
+             "Requests beyond the warmup limit can still grow graphs lazily. "
+             "Does not change target or MTP graph warmup.");
+
+DEFINE_bool(enable_graph_double_buffer,
+            true,
+            "Whether to enable double-buffered ACL graph persistent params "
+            "and graph instances for NPU schedule-overlap decode.");
+
+DEFINE_bool(enable_graph_mode_decode_no_padding,
+            false,
+            "Whether to enable graph execution for decode phase without "
+            "padding. If true, graph will be captured with every actual num "
+            "tokens, as stride is 1.");
+
+DEFINE_bool(enable_prefill_piecewise_graph,
+            false,
+            "Whether to enable piecewise graph execution for prefill phase "
+            "when graph mode is enabled. When enabled, attention operations "
+            "use eager mode while other operations are captured in device "
+            "graphs.");
+
+constexpr bool kEnableGraphVmmPoolDefault = true;
+
+DEFINE_bool(enable_graph_vmm_pool,
+            kEnableGraphVmmPoolDefault,
+            "Whether to enable VMM-backed graph memory pool for multi-shape "
+            "graph memory reuse.");
+
+DEFINE_int32(max_tokens_for_graph_mode,
+             2048,
+             "Maximum number of tokens for graph execution. "
+             "If 0, no limit is applied.");
+
+DEFINE_int32(acl_graph_decode_batch_size_limit,
+             16,
+             "Decode batch size threshold for ACL graph on NPU. "
+             "When actual decode batch_size > this value, ACL graph decode "
+             "falls back to eager mode to avoid OOM.");
+
+DEFINE_bool(enable_shm,
+            false,
+            "Whether to enable shared memory for executing model.");
+
+DEFINE_bool(use_contiguous_input_buffer,
+            true,
+            "Whether to use contiguous device input buffer for executing "
+            "model.");
+
+DEFINE_uint64(input_shm_size,
+              1024,
+              "Input shared memory size, default is 1GB.");
+
+DEFINE_uint64(output_shm_size,
+              128,
+              "Output shared memory size, default is 128MB.");
+
+DEFINE_int32(random_seed, -1, "Random seed for random number generator.");
+
+DEFINE_string(
+    python_graph_backend,
+    "off",
+    "Graph backend for the Python model executor. "
+    "Defaults to aclgraph on NPU when --enable_graph is enabled. "
+    "Values: off (eager), cudagraphs (CUDA decode graph with eager prefill), "
+    "aclgraph (NPU decode graph with eager prefill), "
+    "or any torch.compile backend name.");
+
+DEFINE_bool(
+    enable_fia_decode,
+    false,
+    "Enable FIA for Qwen3.5 decode attention. Applies to both target and MTP "
+    "draft models. Prefill attention is unaffected.");
+
+DEFINE_bool(enable_dsa_multi_stream,
+            false,
+            "Overlap projections within the Python GLM DSA indexer using "
+            "SGLang NPU-style stream scheduling.");
+
+DEFINE_bool(
+    enable_attn_dp_weight_sharding,
+    false,
+    "Shard Python GLM MLA head-dependent attention weights across "
+    "TP and DP ranks. Requires DP > 1, CP=1 and layerwise_split_size=1.");
+
+namespace xllm {
+
+void ExecutionConfig::from_flags() {
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(extension_impl);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_task_pipeline);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_unified_mtp_graph);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(disable_graph_warmup);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(block_draft_graph_warmup_max_kv_len);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_double_buffer);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_mode_decode_no_padding);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_prefill_piecewise_graph);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_vmm_pool);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(max_tokens_for_graph_mode);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(acl_graph_decode_batch_size_limit);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_shm);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(use_contiguous_input_buffer);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(input_shm_size);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(output_shm_size);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(random_seed);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(python_graph_backend);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_fia_decode);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dsa_multi_stream);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_attn_dp_weight_sharding);
+}
+
+void ExecutionConfig::from_json(const JsonReader& json) {
+  XLLM_CONFIG_ASSIGN_FROM_JSON(extension_impl);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_task_pipeline);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_unified_mtp_graph);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(disable_graph_warmup);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(block_draft_graph_warmup_max_kv_len);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_double_buffer);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_mode_decode_no_padding);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_prefill_piecewise_graph);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_vmm_pool);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(max_tokens_for_graph_mode);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(acl_graph_decode_batch_size_limit);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_shm);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(use_contiguous_input_buffer);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(input_shm_size);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(output_shm_size);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(random_seed);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(python_graph_backend);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_fia_decode);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dsa_multi_stream);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_attn_dp_weight_sharding);
+}
+
+void ExecutionConfig::append_config_json(
+    nlohmann::ordered_json& config_json) const {
+  const ExecutionConfig default_config;
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, extension_impl);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_task_pipeline);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_graph);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_unified_mtp_graph);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, disable_graph_warmup);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, block_draft_graph_warmup_max_kv_len);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_graph_double_buffer);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_graph_mode_decode_no_padding);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_prefill_piecewise_graph);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_graph_vmm_pool);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, max_tokens_for_graph_mode);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, acl_graph_decode_batch_size_limit);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_shm);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, use_contiguous_input_buffer);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, input_shm_size);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, output_shm_size);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, random_seed);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, python_graph_backend);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_fia_decode);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_dsa_multi_stream);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_attn_dp_weight_sharding);
+}
+
+ExecutionConfig& ExecutionConfig::get_instance() {
+  static ExecutionConfig config;
+  return config;
+}
+
+void ExecutionConfig::initialize() {
+  from_flags();
+  if (const auto& json_config = config::get_parsed_json_config()) {
+    from_json(*json_config);
+  }
+}
+
+DecodeGraphWarmupConfig ExecutionConfig::decode_graph_warmup_config(
+    int32_t num_speculative_tokens,
+    bool enable_no_padding,
+    std::string_view speculative_algorithm) const {
+  // num_decoding_tokens is owned by this config.
+  DecodeGraphWarmupConfig config{
+      .num_decoding_tokens =
+          num_speculative_tokens > 0 ? num_speculative_tokens + 1 : 1,
+      .num_speculative_tokens = num_speculative_tokens,
+      .enable_graph_mode_decode_no_padding = enable_no_padding,
+      .max_graph_batch_size =
+          Platform::is_npu() ? acl_graph_decode_batch_size_limit() : 0};
+  // Unified capture owns a combined graph key rather than independent draft
+  // graphs. Keep exact/no-padding admission on its existing schedule as well.
+  if (num_speculative_tokens <= 0 || enable_unified_mtp_graph() ||
+      enable_no_padding) {
+    return config;
+  }
+  if (SpeculativeConfig::is_mtp_algorithm(speculative_algorithm)) {
+    if (enable_task_pipeline()) {
+      // The first invocation also repairs the previous accepted boundary.
+      config.draft_shapes.emplace_back(DraftGraphWarmupShape{2, false});
+    }
+    if (!enable_task_pipeline() || num_speculative_tokens > 1) {
+      config.draft_shapes.emplace_back(DraftGraphWarmupShape{1, false});
+    }
+  } else if (enable_task_pipeline() &&
+             SpeculativeConfig::is_dspark_algorithm(speculative_algorithm)) {
+    config.draft_shapes.emplace_back(
+        DraftGraphWarmupShape{num_speculative_tokens, true});
+  } else if (enable_task_pipeline() &&
+             SpeculativeConfig::is_dflash2_algorithm(speculative_algorithm)) {
+    config.draft_shapes.emplace_back(
+        DraftGraphWarmupShape{num_speculative_tokens + 1, true});
+  }
+  return config;
+}
+
+}  // namespace xllm

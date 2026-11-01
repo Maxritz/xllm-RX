@@ -1,0 +1,356 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "core/framework/config/parallel_config_validation.h"
+
+#include <glog/logging.h>
+
+#include <boost/algorithm/string.hpp>
+#include <string_view>
+
+#include "core/framework/config/eplb_config.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/config/parallel_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
+#include "core/framework/model/model_args.h"
+#include "core/framework/parallel_state/parallel_topology.h"
+#include "core/kv_cache/layout/layerwise_split_layout.h"
+#include "core/platform/platform.h"
+#include "core/util/utils.h"
+#include "models/model_registry.h"
+
+namespace xllm {
+namespace {
+
+#include <string>
+#include <algorithm>
+
+bool is_python_cp_compatible_graph_backend(std::string_view graph_backend) {
+  std::string normalized_backend(graph_backend);
+  std::transform(normalized_backend.begin(), normalized_backend.end(), normalized_backend.begin(),
+                 [](unsigned char c){ return std::tolower(c); });
+  return normalized_backend.empty() || normalized_backend == "off" ||
+         normalized_backend == "none" || normalized_backend == "0" ||
+         normalized_backend == "aclgraph";
+}
+
+}  // namespace
+
+void validate_layerwise_split_size_startup_config(const Options& options,
+                                                  const std::string& model_type,
+                                                  int32_t global_world_size) {
+  const ParallelConfig& parallel_config = ParallelConfig::get_instance();
+  const int32_t layerwise_split_size = parallel_config.layerwise_split_size();
+  validate_layerwise_split_size_config(layerwise_split_size);
+  if (layerwise_split_size <= 1) {
+    return;
+  }
+
+  CHECK_GE(options.dp_size(), 1) << "dp_size must be >= 1.";
+  CHECK_GT(global_world_size, 0) << "world_size must be > 0.";
+  const int32_t dp_cp_size = options.dp_size() * options.cp_size();
+  CHECK_EQ(global_world_size % dp_cp_size, 0)
+      << "world_size (" << global_world_size
+      << ") must be divisible by dp_size * cp_size (" << dp_cp_size << ").";
+  const int32_t attn_tp_size = global_world_size / dp_cp_size;
+  validate_layerwise_split_enablement(
+      layerwise_split_size, attn_tp_size, model_type);
+
+  CHECK_LE(options.host_blocks_factor(), 1.0)
+      << "layerwise_split_size > 1 does not support hierarchy host cache.";
+  CHECK_EQ(parallel_config.cp_size(), 1)
+      << "layerwise_split_size > 1 does not support context parallelism.";
+  CHECK_EQ(parallel_config.kv_split_size_effective(), 1)
+      << "layerwise_split_size > 1 does not support KV split.";
+}
+
+std::optional<std::string> validate_context_parallel_config(
+    const Options& options,
+    EngineType engine_type,
+    const std::string& model_type,
+    int32_t global_world_size) {
+  if (options.cp_size() < 1) {
+    return "cp_size must be greater than or equal to 1";
+  }
+
+  const ParallelConfig& parallel_config = ParallelConfig::get_instance();
+  if (parallel_config.kv_split_size() < 0) {
+    return "kv_split_size must be nonnegative; 0 follows cp_size";
+  }
+  const int32_t kv_split = parallel_config.kv_split_size_effective();
+
+  if (options.cp_size() == 1) {
+    if (Platform::is_npu() &&
+        ModelConfig::is_python_model_impl(
+            ModelConfig::get_instance().model_impl()) &&
+        kv_split > 1 && options.dp_size() > 1) {
+      // The Python DCP initializer currently forms KV groups over the whole
+      // world, not inside each DP request domain. Reject before the PCP early
+      // return and before workers can enter mismatched collectives.
+      return "Python DCP requires dp_size == 1 until DP-local KV groups are "
+             "implemented (world_size=" +
+             std::to_string(global_world_size) +
+             ", dp_size=" + std::to_string(options.dp_size()) + ", tp_size=" +
+             std::to_string(global_world_size / options.dp_size()) +
+             ", cp_size=1, kv_split_size=" + std::to_string(kv_split) + ").";
+    }
+    if (Platform::is_npu() &&
+        !ModelConfig::is_python_model_impl(
+            ModelConfig::get_instance().model_impl()) &&
+        kv_split > 1) {
+      if (const auto error = parallel_state::ParallelTopology::validate_dcp_tp(
+              global_world_size, options.dp_size(), kv_split)) {
+        return error;
+      }
+      std::string effective_backend;
+      std::string resolved_name;
+      std::string resolve_error;
+      if (!resolve_model_registration(model_type,
+                                      options.npu_kernel_backend(),
+                                      &effective_backend,
+                                      &resolved_name,
+                                      &resolve_error)) {
+        return "Native DCP rejected model_type=" + model_type + ": " +
+               resolve_error;
+      }
+      const EPLBConfig& eplb_config = EPLBConfig::get_instance();
+      const bool supported_runtime =
+          effective_backend == "TORCH" && engine_type == EngineType::LLM &&
+          options.task_type() == "generate" && options.ep_size() == 1 &&
+          !options.enable_eplb().value_or(eplb_config.enable_eplb()) &&
+          options.expert_parallel_degree().value_or(
+              eplb_config.expert_parallel_degree()) <= 1 &&
+          options.is_local() &&
+          options.rank_tablefile()
+              .value_or(eplb_config.rank_tablefile())
+              .empty() &&
+          options.host_blocks_factor() <= 1.0 &&
+          !options.enable_kvcache_store() &&
+          !KVCacheConfig::get_instance().enable_vmm_kvcache() &&
+          !LoadConfig::get_instance().enable_vmm_weights() &&
+          !options.enable_disagg_pd() &&
+          options.instance_role() == InstanceRole::DEFAULT &&
+          options.draft_model_path().value_or("").empty() &&
+          options.num_speculative_tokens() == 0 &&
+          ExecutionConfig::get_instance().enable_fia_decode() &&
+          is_npu_model_dcp_capable(resolved_name);
+      if (!supported_runtime) {
+        return "Qwen3.5 DCP supports only replicated-GQA local NPU TORCH LLM "
+               "generation without CP, EP/EPLB, host/KVStore/VirtualMemory "
+               "offload, "
+               "P/D, or speculative decoding, and requires "
+               "enable_fia_decode=true";
+      }
+      if (Platform::is_ascend950()) {
+        return "Qwen3.5 DCP is not supported on Ascend950 because its TND "
+               "attention fallback does not return softmax LSE";
+      }
+    }
+    return std::nullopt;
+  }
+
+  if (Platform::is_mlu()) {
+    if (engine_type != EngineType::LLM && engine_type != EngineType::SSM) {
+      return "MLU CP supports only LLM text generation";
+    }
+    if (options.task_type() != "generate") {
+      return "MLU CP supports only the generate task";
+    }
+    if (!is_mlu_model_cp_capable(model_type)) {
+      return "MLU CP does not support model_type=" + model_type;
+    }
+
+    if (global_world_size % (options.dp_size() * options.cp_size()) != 0) {
+      return "MLU CP requires world_size divisible by dp_size * cp_size "
+             "(orthogonal PCP x TP layout)";
+    }
+
+    if (options.dp_size() != 1) {
+      return "MLU CP requires dp_size == 1";
+    }
+
+    if (parallel_config.kv_split_size() != 1) {
+      return "MLU CP requires kv_split_size == 1";
+    }
+
+    if (options.ep_size() != global_world_size) {
+      return "MLU CP requires ep_size == global world size";
+    }
+    return std::nullopt;
+  }
+
+  if (Platform::is_npu()) {
+    if (engine_type != EngineType::LLM && engine_type != EngineType::SSM) {
+      return "Model-side CP supports only LLM text generation";
+    }
+    if (options.task_type() != "generate") {
+      return "Model-side CP supports only the generate task";
+    }
+    const bool is_dsv4_model = util::is_deepseek_v4_model_type(model_type);
+    if (engine_type == EngineType::SSM &&
+        SpeculativeConfig::requires_aux_hidden_capture(
+            options.speculative_algorithm()) &&
+        (!is_dsv4_model || ModelConfig::is_python_model_impl(
+                               ModelConfig::get_instance().model_impl()))) {
+      return "Current model-side CP does not support aux-hidden-capture "
+             "speculative algorithms (Eagle3/DFlash/DSpark); run speculative "
+             "decoding on a cp_size=1 Decode instance.";
+    }
+    // Native model-side CP is compatible with graph mode because the two are
+    // phase-disjoint: CP only engages on batch_forward_type.no_decode(), while
+    // ACL graph captures/replays pure decode. The Python CP path applies the
+    // same phase split only to decode-only ACLGraph; other graph backends are
+    // rejected below.
+    //
+    // Native spec-verify chunked prefill still follows the admission guard in
+    // AclGraphExecutorImpl::run(). Python handles expanded MTP verification as
+    // global query rows without CP row sharding. GLM can use DCP to merge
+    // attention over owner-local KV caches during this phase.
+    if (options.instance_role() != InstanceRole::DEFAULT &&
+        options.instance_role() != InstanceRole::PREFILL) {
+      return "Model-side CP supports only DEFAULT or PREFILL roles";
+    }
+
+    // Python model executor runs a standalone torch CP path (all-gather KV,
+    // eager prefill only) that does not go through the ATB fused-attention op,
+    // so it bypasses the ATB-backend requirement and the ATB CP capability
+    // allowlist below. The safety constraints above (LLM/generate,
+    // DEFAULT/PREFILL) still apply. Orthogonal TP x CP is supported (both may
+    // be > 1, sharing world = cp * tp); the collective communicator builds the
+    // narrowed TP group and the strided CP group as separate torch subgroups
+    // off the shared world rendezvous endpoint. DP > 1 stays unsupported: the
+    // Python executor does not implement the dp * cp * tp rank layout.
+    if (ModelConfig::is_python_model_impl(
+            ModelConfig::get_instance().model_impl())) {
+      // Only models whose Python forward actually shards the sequence (via
+      // cp_shard_rows / cp_merge_rows) may enable CP. Other Python models keep
+      // a full-sequence forward, so a cp_context would be built but never
+      // consumed: qwen3_5 would reach _prefill_cp with unsharded rows (garbled
+      // or out-of-bounds output) and unsupported MLA models would silently
+      // recompute the whole sequence on every rank. Mirror the implementations
+      // that explicitly consume cp_context rather than admitting every Python
+      // model type.
+      if (model_type != "qwen3" && model_type != "glm_moe_dsa" &&
+          model_type != "deepseek_v4" &&
+          !is_glm5_next_target_model_type(model_type)) {
+        return "Python model-side CP does not support model_type=" +
+               model_type +
+               "; supported models are qwen3, glm_moe_dsa, deepseek_v4, "
+               "glm5_next and glm5_3_flash.";
+      }
+      // On NPU, the Python executor resolves enable_graph=true with an
+      // off-like backend to ACLGraph. ACLGraph handles Decode only, so Prefill
+      // still runs through EagerRunner and receives cp_context.
+      if (!is_python_cp_compatible_graph_backend(
+              ExecutionConfig::get_instance().python_graph_backend())) {
+        return "Python model-side CP requires Prefill to use EagerRunner; use "
+               "--python_graph_backend=off or decode-only aclgraph";
+      }
+      if (options.dp_size() != 1) {
+        return "Python CP requires dp_size == 1";
+      }
+      if (global_world_size % (options.dp_size() * options.cp_size()) != 0) {
+        return "Python CP requires world_size divisible by dp_size * cp_size";
+      }
+      if (kv_split < 1 || options.cp_size() % kv_split != 0) {
+        return "Python CP requires kv_split_size effective value to be a "
+               "positive divisor of cp_size";
+      }
+      if (model_type == "deepseek_v4" && kv_split != 1) {
+        return "Python DeepSeek-V4 CP requires replicated KV caches; use "
+               "kv_split_size=1";
+      }
+      if (is_glm5_next_target_model_type(model_type)) {
+        if (engine_type == EngineType::SSM) {
+          return "Python GLM-5 Next CP does not support target-side "
+                 "speculative "
+                 "verification; run speculation on a cp_size=1 Decode instance";
+        }
+        if (options.ep_size() != 1) {
+          return "Python GLM-5 Next CP initially requires ep_size == 1";
+        }
+        if (kv_split != 1) {
+          return "Python GLM-5 Next CP initially requires kv_split_size == 1";
+        }
+        const SchedulerConfig& scheduler_config =
+            SchedulerConfig::get_instance();
+        if (scheduler_config.enable_chunked_prefill()) {
+          return "Python GLM-5 Next CP initially requires "
+                 "enable_chunked_prefill=false";
+        }
+        if (KVCacheConfig::get_instance().enable_prefix_cache()) {
+          return "Python GLM-5 Next CP initially requires "
+                 "enable_prefix_cache=false";
+        }
+        if (scheduler_config.enable_schedule_overlap()) {
+          return "Python GLM-5 Next CP initially requires "
+                 "enable_schedule_overlap=false";
+        }
+        if (options.enable_disagg_pd()) {
+          return "Python GLM-5 Next CP does not support disaggregated PD";
+        }
+      }
+      return std::nullopt;
+    }
+
+    // Require registered NPU model-side CP capability. The backend is not
+    // constrained: ATB models drive CP through NpuCpPlan, while TORCH models
+    // (deepseek_v4) own their CP split inside the model. Both rely on the
+    // orthogonal dp * cp * attn_tp == world layout validated below.
+    std::string effective_backend;
+    std::string resolved_name;
+    std::string resolve_error;
+    // Runtime platform branches are type-checked in every platform build.
+    const std::string requested_backend = options.npu_kernel_backend();
+    if (!resolve_model_registration(model_type,
+                                    requested_backend,
+                                    &effective_backend,
+                                    &resolved_name,
+                                    &resolve_error)) {
+      return "Model-side CP rejected model_type=" + model_type + ": " +
+             resolve_error;
+    }
+    if (!is_npu_model_cp_capable(resolved_name)) {
+      return "NPU model-side CP does not support model_type=" + model_type +
+             " (resolved=" + resolved_name +
+             "); only deepseek_v32, deepseek_v32_mtp, deepseek_v4, "
+             "deepseek_v4_mtp, glm_moe_dsa, glm_moe_dsa_mtp are registered as "
+             "CP-capable.";
+    }
+    if (global_world_size % (options.dp_size() * options.cp_size()) != 0) {
+      return "NPU CP requires world_size divisible by dp_size * cp_size "
+             "(orthogonal CP x TP layout)";
+    }
+    const int32_t attn_tp_size =
+        global_world_size / (options.dp_size() * options.cp_size());
+    if (attn_tp_size < 1) {
+      return "NPU CP requires attn_tp_size >= 1";
+    }
+    if (kv_split < 1 || options.cp_size() % kv_split != 0) {
+      return "NPU CP requires kv_split_size effective value to be a positive "
+             "divisor of cp_size";
+    }
+    return std::nullopt;
+  }
+
+  return "cp_size > 1 is only supported on platforms with model-side CP "
+         "(MLU/NPU); disable CP (cp_size=1) or use MLU/NPU.";
+}
+
+}  // namespace xllm

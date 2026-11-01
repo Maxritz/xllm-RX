@@ -1,0 +1,155 @@
+include(cc_binary)
+include(cc_library)
+
+cc_library(
+  NAME
+    batch
+  HDRS
+    dit_batch.h
+    dit_batch_factory.h
+    dit_forward_input_builder.h
+    dit_forward_input_factory.h
+    batch_input_data.h
+    batch.h
+    batch_group.h
+    batch_state.h
+    rec_batch.h
+    rec_batch_state.h
+    rec_batch_group.h
+    batch_output_action.h
+    batch_output_handler.h
+    rec_batch_output_handler.h
+    batch_sequence_plan.h
+    batch_builder.h
+    rec_batch_builder.h
+    batch_factory.h
+    rec_batch_factory.h
+    forward_input_builder.h
+    forward_input_factory.h
+    vlm_forward_input_factory.h
+    rec_forward_input_factory.h
+    sampling_input_builder.h
+    rec_forward_input_builder.h
+    onerec_forward_input_builder.h
+    onerec_xattention_forward_input_builder.h
+    rec_multi_round_forward_input_builder.h
+  SRCS
+    dit_batch.cpp
+    dit_batch_factory.cpp
+    dit_forward_input_builder.cpp
+    dit_forward_input_factory.cpp
+    batch.cpp
+    batch_group.cpp
+    batch_state.cpp
+    rec_batch.cpp
+    rec_batch_state.cpp
+    rec_batch_group.cpp
+    batch_output_handler.cpp
+    rec_batch_output_handler.cpp
+    batch_sequence_plan.cpp
+    batch_builder.cpp
+    rec_batch_builder.cpp
+    batch_factory.cpp
+    rec_batch_factory.cpp
+    forward_input_builder.cpp
+    forward_input_factory.cpp
+    vlm_forward_input_factory.cpp
+    rec_forward_input_factory.cpp
+    sampling_input_builder.cpp
+    rec_forward_input_builder.cpp
+    onerec_forward_input_builder.cpp
+    onerec_xattention_forward_input_builder.cpp
+    rec_multi_round_forward_input_builder.cpp
+    beam_search.h
+  DEPS
+    :config
+    :eplb
+    :request
+    :runtime
+    :common
+    :util
+    :mposition
+    absl::inlined_vector
+    glog::glog
+    xxHash
+)
+
+# Request-path hop 4: Batch -> ForwardInput -> packed proto -> worker output
+# proto -> Batch::process_sample_output (all host-side, CPU tensors).
+cc_binary(
+  NAME
+    batch_benchmark
+  SRCS
+    batch_benchmark.cpp
+    batch_factory_benchmark.cpp
+  DEPS
+    :config
+    :batch
+    :worker_model_codec
+    torch
+    benchmark::benchmark
+    $<$<BOOL:${USE_NPU}>:npu_startup>
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+)
+target_link_libraries(batch_benchmark
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(batch_benchmark
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+# BatchFactory construction uses host metadata only, without pinned tensors or
+# Python/device startup. Keep the same cases available in batch_benchmark.
+cc_binary(
+  NAME
+    batch_factory_benchmark
+  SRCS
+    batch_factory_benchmark.cpp
+  DEPS
+    :config
+    :batch
+    torch
+    benchmark::benchmark
+    benchmark::benchmark_main
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+)
+target_link_libraries(batch_factory_benchmark
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(batch_factory_benchmark
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+# Engine-owned factory: rank-local builders and global DP metadata, on CPU.
+cc_binary(
+  NAME
+    forward_input_factory_benchmark
+  SRCS
+    forward_input_factory_benchmark.cpp
+  DEPS
+    :batch
+    torch
+    benchmark::benchmark
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+)
+target_link_libraries(forward_input_factory_benchmark
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(forward_input_factory_benchmark
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)

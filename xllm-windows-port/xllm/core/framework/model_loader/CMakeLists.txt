@@ -1,0 +1,30 @@
+add_subdirectory(weight)
+
+include(cc_library)
+
+cc_library(
+  NAME
+    model_loader
+  HDRS
+    hf_model_args.h
+    hf_model_config.h
+    hf_model_loader.h
+    dit_model_loader.h
+    model_loader.h
+  SRCS
+    hf_model_args.cpp
+    hf_model_config.cpp
+    hf_model_loader.cpp
+    dit_model_loader.cpp
+    model_loader.cpp
+  DEPS
+    :common
+    :model
+    :model_context
+    :kv_cache
+    :models
+    :quantization
+    $<$<BOOL:${USE_NPU}>:npu_layers>
+    :tokenizer
+    torch
+)

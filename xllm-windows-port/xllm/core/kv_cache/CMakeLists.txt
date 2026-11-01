@@ -1,0 +1,172 @@
+include(cc_library)
+
+add_subdirectory(block)
+add_subdirectory(events)
+add_subdirectory(prefix)
+add_subdirectory(transfer)
+
+cc_library(
+  NAME
+    virtual_kv_cache_page_layout
+  HDRS
+    layout/virtual_kv_cache_page_layout.h
+  DEPS
+    glog::glog
+)
+
+# Domain ports shared by cache storage and framework allocation adapters.
+cc_library(
+  NAME
+    kv_cache_memory_interfaces
+  HDRS
+    storage/vmm_kv_page_allocator.h
+    storage/kv_cache_page_backend.h
+    storage/kv_cache_tensor_allocator.h
+    layout/kv_cache_tensor_role.h
+    layout/virtual_kv_cache_offsets.h
+    transfer/virtual_kv_cache_transfer_memory_provider.h
+  DEPS
+    :virtual_kv_cache_page_state
+    :virtual_kv_cache_page_layout
+    torch
+)
+
+# KV page queues and preallocation policy use an injected mapping backend.
+cc_library(
+  NAME
+    vmm_kv_page_allocator_impl
+  HDRS
+    storage/vmm_kv_page_allocator_impl.h
+  SRCS
+    storage/vmm_kv_page_allocator_impl.cpp
+  DEPS
+    :kv_cache_memory_interfaces
+    :virtual_kv_cache_page_state
+    glog::glog
+)
+
+cc_library(
+  NAME
+    deepseek_v4_cache_policy
+  HDRS
+    layout/deepseek_v4_cache_policy.h
+  DEPS
+    torch
+)
+
+# KV-specific mappings are a concrete cache storage backend. Generic byte
+# mappings and the Torch view adapter remain framework allocation facilities.
+cc_library(
+  NAME
+    virtual_memory_kv_cache_storage
+  HDRS
+    storage/virtual_kv_cache_memory_regions.h
+    storage/virtual_kv_cache_memory_registry.h
+    storage/vmm_kv_tensor_allocator.h
+  SRCS
+    storage/virtual_kv_cache_memory_regions.cpp
+    storage/virtual_kv_cache_memory_registry.cpp
+    storage/vmm_kv_tensor_allocator.cpp
+  DEPS
+    :kv_cache_memory_interfaces
+    :virtual_memory_torch
+    glog::glog
+    torch
+)
+
+cc_library(
+  NAME
+    virtual_kv_cache_transfer_memory_provider_impl
+  HDRS
+    transfer/virtual_kv_cache_transfer_memory_provider_impl.h
+  SRCS
+    transfer/virtual_kv_cache_transfer_memory_provider_impl.cpp
+  DEPS
+    :virtual_memory_kv_cache_storage
+    :global_virtual_memory_region
+    :kv_cache_memory_interfaces
+    glog::glog
+)
+
+cc_library(
+  NAME
+    kv_cache_estimation
+  HDRS
+    layout/kv_cache_capacity.h
+    layout/kv_cache_estimation.h
+  SRCS
+    layout/kv_cache_estimation.cpp
+  DEPS
+    :common
+    :config
+    :deepseek_v4_cache_policy
+    :block_utils
+    :platform
+    glog::glog
+    proto::xllm_proto
+    torch
+)
+
+cc_library(
+  NAME
+    kv_cache
+  HDRS
+    layout/cache_layout_builder.h
+    layout/cache_layout_types.h
+    layout/flashinfer_cache_layout.h
+    linear_state_types.h
+    storage/deepseek_v4_kv_cache_impl.h
+    storage/indexed_kv_cache_impl.h
+    storage/kpool_kv_cache_impl.h
+    storage/kv_cache.h
+    storage/kv_cache_impl.h
+    layout/kv_cache_shape.h
+    layout/kv_shard_layout.h
+    storage/kv_cache_tensor_allocator.h
+    layout/kv_cache_tensor_role.h
+    storage/kv_cache_utils.h
+    layout/layerwise_split_layout.h
+    layout/vmm_kv_cache_layout.h
+    storage/linear_attention_kv_cache_impl.h
+    storage/quantized_kv_cache_impl.h
+  SRCS
+    layout/cache_layout_builder.cpp
+    storage/deepseek_v4_kv_cache_impl.cpp
+    storage/indexed_kv_cache_impl.cpp
+    storage/kpool_kv_cache_impl.cpp
+    storage/kv_cache.cpp
+    storage/kv_cache_impl.cpp
+    layout/kv_cache_shape.cpp
+    layout/kv_shard_layout.cpp
+    layout/vmm_kv_cache_layout.cpp
+    storage/kv_cache_tensor_allocator.cpp
+    storage/kv_cache_utils.cpp
+    storage/linear_attention_kv_cache_impl.cpp
+    storage/quantized_kv_cache_impl.cpp
+  DEPS
+    :block_utils
+    :common
+    :deepseek_v4_cache_policy
+    :kv_cache_estimation
+    :kv_cache_memory_interfaces
+    glog::glog
+    torch
+    $<$<BOOL:${USE_MLU}>:cndrv>
+    $<$<BOOL:${USE_NPU}>:ascendcl>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+)
+
+# Keep worker-side state preparation separate from the base cache storage.
+cc_library(
+  NAME
+    linear_state_restore
+  HDRS
+    linear_state_restore.h
+  SRCS
+    linear_state_restore.cpp
+  DEPS
+    :common
+    :kv_cache
+    glog::glog
+    torch
+)

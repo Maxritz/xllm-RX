@@ -1,0 +1,237 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "core/runtime/vlm_worker_impl.h"
+
+#include <c10/core/DeviceGuard.h>
+#include <glog/logging.h>
+#include <torch/torch.h>
+
+#include <memory>
+#include <optional>
+
+#include "common/macros.h"
+#include "common/metrics.h"
+#include "core/framework/config/load_config.h"
+#include "core/framework/model/model_params_view.h"
+#include "core/framework/sampling/sampler.h"
+#include "core/framework/speculative/draft_extend_input.h"
+#include "core/kv_cache/storage/kv_cache.h"
+#include "core/runtime/task_execution_pipeline.h"
+#include "models/model_registry.h"
+#include "util/timer.h"
+
+namespace xllm {
+
+namespace {
+
+void wait_input_ready_events(const VlmForwardInput& input,
+                             const Stream& stream) {
+  CHECK(stream.wait_event(input.runtime.metadata_ready_event))
+      << "failed to wait VlmForwardInput metadata ready event";
+}
+
+}  // namespace
+
+VLMWorkerImpl::VLMWorkerImpl(const ParallelArgs& parallel_args,
+                             const torch::Device& device,
+                             const runtime::Options& options)
+    : WorkerImpl(parallel_args, device, options) {
+  device_.set_device();
+}
+
+bool VLMWorkerImpl::init_model(ModelContext& context) {
+  CHECK(model_ == nullptr) << "Model is already initialized.";
+
+  // initialize model
+  context.set_encoder_embedding_mode(false);
+  model_ = create_vlm_model(context);
+  CHECK(model_ != nullptr) << "Failed to create model.";
+  // The worker task path preserves the full multimodal input and uses the
+  // model's decode ACL graphs. Prepared LLM Slots do not carry visual data.
+  runtime::Options executor_options = options_;
+  executor_options.enable_task_pipeline(false);
+  model_executor_ = std::make_unique<Executor>(
+      model_.get(), context.get_model_args(), device_, executor_options);
+  return true;
+}
+
+::xllm::Status VLMWorkerImpl::create_task_pipeline(
+    std::unique_ptr<TaskExecutionPipeline>& output) {
+  LlmTaskCapacity capacity;
+  ::xllm::Status status = task_capacity(options_, capacity);
+  if (!status.ok()) {
+    return status;
+  }
+  status = TaskExecutionPipeline::create(
+      threadpool_, task_model(), *this, capacity, output);
+  if (status.ok()) {
+    LOG(INFO) << "VLM task execution pipeline: slots=" << capacity.slot_count;
+  }
+  return status;
+}
+
+std::optional<ForwardOutput> VLMWorkerImpl::step(const VlmForwardInput& input) {
+  if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
+#if defined(USE_NPU)
+    if (!enable_schedule_overlap()) {
+      aclrtStream current_stream =
+          c10_npu::getCurrentNPUStream(device_.index()).stream();
+      atb::Context* atb_context =
+          const_cast<atb::Context*>(context_.get_atb_context());
+      atb_context->SetExecuteStream(current_stream);
+      std::unique_ptr<Stream> stream = device_.current_stream();
+      wait_input_ready_events(input, *stream);
+      return step_internal(input, ForwardSyncPolicy::LEGACY);
+    } else {
+      SET_ATB_EXECUTE_STREAM(compute_stream_, device_, context_);
+      wait_input_ready_events(input, *compute_stream_);
+      return step_internal(input, ForwardSyncPolicy::LEGACY);
+    }
+#else
+    std::unique_ptr<Stream> stream = device_.current_stream();
+    wait_input_ready_events(input, *stream);
+    return step_internal(input, ForwardSyncPolicy::LEGACY);
+#endif
+  }
+  std::unique_ptr<Stream> stream = device_.current_stream();
+  wait_input_ready_events(input, *stream);
+  return step_internal(input, ForwardSyncPolicy::LEGACY);
+}
+
+std::optional<ForwardOutput> VLMWorkerImpl::step_for_schedule_overlap(
+    const VlmForwardInput& input) {
+  prepare_schedule_overlap(input);
+  return execute_no_sync_on_stream(
+      input, *compute_stream_, ForwardCompletion::RECORD_EVENT);
+}
+
+std::optional<ForwardOutput> VLMWorkerImpl::execute_no_sync_on_stream(
+    const VlmForwardInput& input,
+    Stream& compute_stream,
+    ForwardCompletion completion) {
+  const ForwardSyncPolicy sync_policy = ForwardSyncPolicy::NO_SYNC;
+  c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
+  if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
+#if defined(USE_NPU)
+    if (!enable_schedule_overlap()) {
+      aclrtStream current_acl_stream =
+          c10_npu::getCurrentNPUStream(device_.index()).stream();
+      atb::Context* atb_context =
+          const_cast<atb::Context*>(context_.get_atb_context());
+      atb_context->SetExecuteStream(current_acl_stream);
+      wait_input_ready_events(input, compute_stream);
+      return step_internal(input, sync_policy, completion);
+    } else {
+      SET_ATB_EXECUTE_STREAM((&compute_stream), device_, context_);
+      wait_input_ready_events(input, compute_stream);
+      return step_internal(input, sync_policy, completion);
+    }
+#else
+    wait_input_ready_events(input, compute_stream);
+    return step_internal(input, sync_policy, completion);
+#endif
+  }
+  wait_input_ready_events(input, compute_stream);
+  return step_internal(input, sync_policy, completion);
+}
+
+std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
+    const VlmForwardInput& input,
+    ForwardSyncPolicy sync_policy,
+    ForwardCompletion completion) {
+  Timer timer;
+  const bool empty_shard =
+      input.input_params.meta.num_sequences == 0 &&
+      (!input.token_ids.defined() || input.token_ids.numel() == 0);
+  if (empty_shard) {
+    return ForwardOutput{};
+  }
+
+  const auto& sampling_params = input.sampling_params;
+  ModelOutput model_output;
+  torch::Tensor logits;
+  torch::Tensor lm_head_selected_token_idxes;
+  torch::Tensor selected_hidden_from_lm_head;
+  {
+    ModelParamsView params(input.input_params);
+    model_output = model_executor_->forward(
+        input.token_ids, input.positions, kv_caches_, params);
+    if (sampling_params.num_sample_seqs() > 0) {
+      lm_head_selected_token_idxes = remap_selected_token_idxes_for_lm_head(
+          sampling_params.selected_token_idxes(),
+          params.parallel,
+          model_output.hidden_states);
+    }
+  }
+
+  if (sampling_params.num_sample_seqs() > 0) {
+    if (options_.enable_speculative_decode()) {
+      logits = model_->logits(model_output.hidden_states,
+                              lm_head_selected_token_idxes,
+                              selected_hidden_from_lm_head);
+    } else {
+      logits = model_->logits(model_output.hidden_states,
+                              lm_head_selected_token_idxes);
+    }
+  }
+
+  COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
+
+  if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
+      !options_.enable_speculative_decode()) {
+    if (sync_policy == ForwardSyncPolicy::LEGACY) {
+      auto ret = device_.synchronize_default_stream();
+      (void)ret;
+    }
+    return std::nullopt;
+  }
+
+  ForwardOutput output;
+  if (sampling_params.num_sample_seqs() > 0) {
+    output.logprobs = sampling_params.logprobs();
+    output.max_top_logprobs = sampling_params.max_top_logprobs();
+    if (!input.skip_sampling_for_logits_only) {
+      auto sample_output = sample(logits, sampling_params);
+      COUNTER_ADD(execution_latency_seconds_sampling, timer.elapsed_seconds());
+
+      output.sample_output = sample_output;
+    }
+    output.logits = logits;
+  }
+
+  if (options_.enable_speculative_decode()) {
+    const bool is_target_prefill =
+        !input.input_params.meta.batch_forward_type.is_decode() &&
+        !is_spec_draft_;
+    output_spec_hidden_states(output.sample_output,
+                              model_output,
+                              lm_head_selected_token_idxes,
+                              selected_hidden_from_lm_head,
+                              is_target_prefill,
+                              /*cp_enabled=*/options_.cp_size() > 1);
+  }
+
+  if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
+    finalize_no_sync_output(output, input, completion);
+    return output;
+  }
+
+  auto ret = device_.synchronize_default_stream();
+  (void)ret;
+  return output;
+}
+
+}  // namespace xllm

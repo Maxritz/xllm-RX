@@ -1,0 +1,81 @@
+# Windows 11 ROCm 10.1 (7.16) Pure C++ RDNA2/RDNA4 Util
+# Boost and Torch dependencies ELIMINATED
+
+include(cc_library)
+
+cc_library(
+  NAME
+    util
+  HDRS
+    concurrent_queue.h
+    blocking_counter.h
+    blockingconcurrentqueue.h
+    binary_payload.h
+    closure_guard.h
+    concurrentqueue.h
+    cpu_affinity.h
+    env_var.h
+    hash_util.h
+    http_downloader.h
+    json_reader.h
+    dit_model_discovery.h
+    lightweightsemaphore.h
+    net.h
+    pretty_print.h
+    pybind_helper.h
+    rec_model_utils.h
+    scope_guard.h
+    slice.h
+    spin_lock.h
+    spin_rw_lock.h
+    int32_map.h
+    linalg.h
+    suffix_decoding_cache.h
+    suffix_tree.h
+    tensor_helper.h
+    threadpool.h
+    timer.h
+    type_traits.h
+    utils.h
+    uuid.h
+    verbose_trace_logger.h
+    shared_memory_manager.h
+  SRCS
+    binary_payload.cpp
+    cpu_affinity.cpp
+    env_var.cpp
+    hash_util.cpp
+    http_downloader.cpp
+    json_reader.cpp
+    dit_model_discovery.cpp
+    linalg.cpp
+    net.cpp
+    pretty_print.cpp
+    suffix_decoding_cache.cpp
+    suffix_tree.cpp
+    threadpool.cpp
+    timer.cpp
+    utils.cpp
+    uuid.cpp
+    verbose_trace_logger.cpp
+    shared_memory_manager.cpp
+  DEPS
+    Folly::folly
+    brpc
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    leveldb::leveldb
+    nlohmann_json::nlohmann_json
+    glog::glog
+    $<$<BOOL:${USE_NPU}>:ms_tools_ext>
+    absl::synchronization
+    ${Python_LIBRARIES}
+    proto::xllm_proto
+    SMHasherSupport
+    xxHash
+    spdlog::spdlog
+    # Boost::serialization REMOVED
+    # torch REMOVED
+)
+
+add_dependencies(util brpc-static)

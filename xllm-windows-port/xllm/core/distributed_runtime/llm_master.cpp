@@ -1,0 +1,734 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "llm_master.h"
+
+#include <glog/logging.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <memory>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "api_service/call.h"
+#include "api_service/openai_json.h"
+#include "common/metrics.h"
+#include "core/distributed_runtime/disagg_pd_service_impl.h"
+#include "core/distributed_runtime/engine_dispatch.h"
+#include "core/distributed_runtime/kv_cache_transfer_coordinator.h"
+#include "core/distributed_runtime/model_residency_coordinator.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/config/parallel_config_validation.h"
+#include "core/framework/config/speculative_config.h"
+#include "core/framework/model_loader/hf_model_config.h"
+#include "framework/chat_template/chat_template_factory.h"
+#include "framework/model/model_args.h"
+#include "framework/request/request.h"
+#if defined(USE_NPU)
+#include "models/model_registry.h"
+#endif
+#include "distributed_runtime/xservice_client.h"
+#include "runtime/options.h"
+#include "scheduler/profile/profile_manager.h"
+#include "scheduler/scheduler_factory.h"
+#include "server/xllm_server_registry.h"
+#include "util/net.h"
+#include "util/scope_guard.h"
+#include "util/timer.h"
+#include "util/utils.h"
+
+namespace xllm {
+
+LLMMaster::LLMMaster(const Options& options)
+    : Master(options), master_status_(options.master_status()) {
+  options_.enable_mla(should_enable_mla(
+      std::filesystem::path(options_.model_path()), options_.backend()));
+#if defined(USE_NPU)
+  resolve_npu_kernel_backend(&options_, /*model_component=*/"causal_lm");
+#endif
+  const bool use_ssm_engine = SpeculativeConfig::uses_ssm_engine(
+      options_.draft_model_path().value_or(""),
+      options_.speculative_algorithm(),
+      options_.num_speculative_tokens());
+  const EngineType engine_type =
+      use_ssm_engine ? EngineType::SSM : EngineType::LLM;
+  const std::string model_type =
+      get_model_type(options_.model_path(), options_.backend());
+  const std::optional<std::string> cp_error = validate_context_parallel_config(
+      options_, engine_type, model_type, options_.nnodes());
+  CHECK(!cp_error.has_value()) << cp_error.value();
+  const std::optional<std::string> speculative_error =
+      ModelConfig::validate_python_speculative_decode(
+          ModelConfig::get_instance().model_impl(),
+          model_type,
+          options_.num_speculative_tokens(),
+          options_.speculative_algorithm());
+  CHECK(!speculative_error.has_value()) << speculative_error.value();
+  CHECK(
+      !options_.enable_adaptive_draft_step() ||
+      (options_.enable_task_pipeline() && options_.enable_schedule_overlap() &&
+       options_.enable_graph() && !options_.enable_disagg_pd() &&
+       options_.dp_size() == 1 && options_.cp_size() == 1 &&
+       SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm()) &&
+       model_type == "glm_moe_dsa"))
+      << "Adaptive MTP requires Python GLM DSA, ordinary graphs, async task "
+         "pipeline and DP=CP=1.";
+  validate_layerwise_split_size_startup_config(
+      options_, model_type, options_.nnodes());
+
+  if (options_.enable_task_pipeline()) {
+    const bool supported_speculation =
+        SpeculativeConfig::supports_task_pipeline(
+            options_.speculative_algorithm());
+    CHECK((engine_type == EngineType::LLM ||
+           (engine_type == EngineType::SSM && supported_speculation)) &&
+          options_.task_type() == "generate" &&
+          !options_.enable_offline_inference())
+        << "Task pipeline requires online LLM, MTP, DFlash, DFlash2 or DSpark "
+           "generation.";
+    CHECK(master_status_ == MasterStatus::WAKEUP)
+        << "Task pipeline must start with loaded weights.";
+  }
+  if (options_.host_blocks_factor() > 1.0) {
+    const bool supports_host_offload =
+        engine_type == EngineType::LLM ||
+        SpeculativeConfig::supports_host_kv_cache(
+            options_.speculative_algorithm());
+    CHECK(supports_host_offload)
+        << "Basic host KV cache offload supports the LLM engine and "
+           "model-based speculative engines only.";
+  }
+
+  if (!use_ssm_engine &&
+      (options_.task_type() == "embed" || options_.task_type() == "mm_embed")) {
+    options_.enable_schedule_overlap(false);
+    LOG(WARNING) << "Force to disable schedule overlap for embedding model, "
+                    "avoiding performance degradation.";
+  }
+
+  runtime::Options engine_options;
+  engine_options.model_path(options_.model_path())
+      .model_id(options_.model_id())
+      .model_impl(ModelConfig::get_instance().model_impl())
+      .extension_impl(options_.extension_impl())
+      .devices(devices_)
+      .backend(options_.backend())
+      .max_memory_utilization(options_.max_memory_utilization())
+      .enable_prefix_cache(options_.enable_prefix_cache())
+      .task_type(options_.task_type())
+      .npu_kernel_backend(options_.npu_kernel_backend())
+      .master_node_addr(options_.master_node_addr())
+      .nnodes(options_.nnodes())
+      .node_rank(options_.node_rank())
+      .dp_size(options_.dp_size())
+      .ep_size(options_.ep_size())
+      .cp_size(options_.cp_size())
+      .enable_schedule_overlap(options_.enable_schedule_overlap())
+      .enable_chunked_prefill(options_.enable_chunked_prefill())
+      .enable_offline_inference(options_.enable_offline_inference())
+      .disable_log_stats(options_.disable_log_stats())
+      .spawn_worker_path(options_.spawn_worker_path())
+      .enable_shm(options_.enable_shm())
+      .input_shm_size(options_.input_shm_size() * 1024 * 1024)
+      .output_shm_size(options_.output_shm_size() * 1024 * 1024)
+      .is_local(options_.is_local())
+      .block_size(options_.block_size())
+      .max_cache_size(options_.max_cache_size())
+      .max_linear_state_cache_slots(options_.max_linear_state_cache_slots())
+      .enable_mla(options_.enable_mla())
+      .enable_flashcomm1(options_.enable_flashcomm1())
+      .flashcomm1_min_prefill_tokens(options_.flashcomm1_min_prefill_tokens())
+      .enable_mmrs_fusion(options_.enable_mmrs_fusion())
+      .mmrs_comm_mode(options_.mmrs_comm_mode())
+      .instance_role(options_.instance_role())
+      .enable_disagg_pd(options_.enable_disagg_pd())
+      .kv_cache_transfer_mode(options_.kv_cache_transfer_mode())
+      .transfer_listen_port(options_.transfer_listen_port())
+      .enable_service_routing(options_.enable_service_routing())
+      .server_idx(options_.server_idx())
+      .enable_task_pipeline(options_.enable_task_pipeline())
+      .enable_graph(options_.enable_graph())
+      .enable_graph_mode_decode_no_padding(
+          options_.enable_graph_mode_decode_no_padding())
+      .enable_prefill_piecewise_graph(options_.enable_prefill_piecewise_graph())
+      .max_tokens_for_graph_mode(options_.max_tokens_for_graph_mode())
+      .max_seqs_per_batch(options_.max_seqs_per_batch())
+      .max_tokens_per_batch(options_.max_tokens_per_batch())
+      .max_tokens_per_chunk_for_prefill(
+          options_.max_tokens_per_chunk_for_prefill())
+      .host_blocks_factor(options_.host_blocks_factor())
+      .enable_kvcache_store(options_.enable_kvcache_store())
+      .store_protocol(options_.store_protocol())
+      .store_rdma_devices(options_.store_rdma_devices())
+      .store_master_server_address(options_.store_master_server_address())
+      .store_metadata_server(options_.store_metadata_server())
+      .store_local_hostname(options_.store_local_hostname())
+      .prefetch_batch_size(options_.prefetch_batch_size())
+      .prefetch_timeout(options_.prefetch_timeout())
+      .layers_wise_copy_batchs(options_.layers_wise_copy_batchs())
+      .kv_cache_dtype(options_.kv_cache_dtype());
+
+  if (!use_ssm_engine) {
+    llm_engine_ = std::make_unique<LLMEngine>(engine_options);
+  } else {
+    const std::string draft_model_path =
+        options_.draft_model_path().value_or("");
+    const bool use_suffix_spec = SpeculativeConfig::is_suffix_algorithm(
+        options_.speculative_algorithm());
+    CHECK(use_suffix_spec || !draft_model_path.empty())
+        << "draft model path is required unless --speculative_algorithm=Suffix";
+    engine_options.draft_model_path(draft_model_path)
+        .num_speculative_tokens(options_.num_speculative_tokens())
+        .speculative_algorithm(options_.speculative_algorithm())
+        .enable_probabilistic_draft(options_.enable_probabilistic_draft())
+        .enable_mtp_draft_body_tp1(options_.enable_mtp_draft_body_tp1())
+        .speculative_suffix_cache_max_depth(
+            options_.speculative_suffix_cache_max_depth())
+        .speculative_suffix_max_spec_factor(
+            options_.speculative_suffix_max_spec_factor())
+        .speculative_suffix_max_spec_offset(
+            options_.speculative_suffix_max_spec_offset())
+        .speculative_suffix_min_token_prob(
+            options_.speculative_suffix_min_token_prob())
+        .speculative_suffix_max_cached_requests(
+            options_.speculative_suffix_max_cached_requests())
+        .speculative_suffix_use_tree_spec(
+            options_.speculative_suffix_use_tree_spec())
+        .enable_adaptive_target_verify(options_.enable_adaptive_target_verify())
+        .enable_adaptive_draft_step(options_.enable_adaptive_draft_step())
+        .adaptive_draft_step_config(options_.adaptive_draft_step_config())
+        .adaptive_target_verify_min_gain(
+            options_.adaptive_target_verify_min_gain())
+        .adaptive_target_verify_cost_table(
+            options_.adaptive_target_verify_cost_table())
+        .adaptive_target_verify_calibration(
+            options_.adaptive_target_verify_calibration());
+    if (use_suffix_spec) {
+      suffix_engine_ =
+          std::make_unique<SuffixSpeculativeEngine>(engine_options);
+    } else {
+      speculative_engine_ =
+          std::make_unique<SpeculativeEngineBase<LLMEngine>>(engine_options);
+    }
+  }
+  distributed_worker_manager_ = dispatch_engine(
+      [](auto* engine) { return engine->get_distributed_worker_manager(); },
+      llm_engine_.get(),
+      suffix_engine_.get(),
+      speculative_engine_.get());
+  model_residency_coordinator_ = std::make_shared<ModelResidencyCoordinator>(
+      ModelResidencyCoordinator::Options{
+          .enabled = KVCacheConfig::get_instance().enable_vmm_kvcache() ||
+                     LoadConfig::get_instance().enable_vmm_weights(),
+          .model_id = engine_options.model_id()},
+      distributed_worker_manager_);
+  if (!is_leader()) {
+    return;
+  }
+
+  kv_transfer_coordinator_ = std::make_shared<KVCacheTransferCoordinator>(
+      KVCacheTransferCoordinator::Options{
+          .dp_size = options_.dp_size(),
+          .prefetch_timeout_ms = options_.prefetch_timeout()},
+      distributed_worker_manager_);
+
+  const LLMEngine::ModelInitCallback prepare_model =
+      [this](const ModelLoader& model_loader,
+             int64_t num_layers,
+             int32_t dp_size,
+             int32_t tp_size,
+             MasterStatus master_status) {
+        return model_residency_coordinator_->initialize_model(
+            model_loader, num_layers, dp_size, tp_size, master_status);
+      };
+  auto initialize_engine = [this, &prepare_model](auto* engine) {
+    CHECK(
+        engine->init(master_status_, prepare_model, kv_transfer_coordinator_));
+    if (llm_engine_ != nullptr) {
+      CHECK(
+          model_residency_coordinator_->finish_initialization(master_status_));
+    }
+    model_args_ = engine->model_args();
+    if (options_.enable_service_routing()) {
+      xservice_client_ = XServiceClient::get_instance();
+      CHECK(xservice_client_->init(options_.etcd_addr().value_or(""),
+                                   options_.instance_name().value_or(""),
+                                   options_.etcd_namespace().value_or("")))
+          << "XServiceClient init fail!";
+    }
+  };
+  dispatch_engine(initialize_engine,
+                  llm_engine_.get(),
+                  suffix_engine_.get(),
+                  speculative_engine_.get());
+  task_type_ = options_.task_type();
+
+  SchedulerOptions scheduler_options;
+  scheduler_options.max_tokens_per_batch(options_.max_tokens_per_batch())
+      .max_seqs_per_batch(options_.max_seqs_per_batch())
+      .enable_task_pipeline(options_.enable_task_pipeline())
+      .request_queue_size(options_.request_queue_size())
+      .max_tokens_per_chunk_for_prefill(
+          options_.max_tokens_per_chunk_for_prefill())
+      .num_speculative_tokens(options_.num_speculative_tokens())
+      .decode_graph_warmup_config(
+          ExecutionConfig::get_instance().decode_graph_warmup_config(
+              options_.num_speculative_tokens(),
+              options_.enable_graph_mode_decode_no_padding(),
+              options_.speculative_algorithm()))
+      .nnodes(options_.nnodes())
+      .dp_size(options_.dp_size())
+      .cp_size(options_.cp_size())
+      .enable_disagg_pd(options_.enable_disagg_pd())
+      .enable_schedule_overlap(options_.enable_schedule_overlap())
+      .enable_chunked_prefill(options_.enable_chunked_prefill())
+      .instance_name(options_.instance_name())
+      .instance_role(options_.instance_role())
+      .kv_cache_transfer_mode(options_.kv_cache_transfer_mode())
+      .enable_service_routing(options_.enable_service_routing())
+      .disable_log_stats(options_.disable_log_stats())
+      .priority_strategy(options_.priority_strategy())
+      .enable_profile_step_time(options_.enable_profile_step_time())
+      .enable_profile_token_budget(options_.enable_profile_token_budget())
+      .enable_latency_aware_schedule(options_.enable_latency_aware_schedule())
+      .profile_max_prompt_length(options_.profile_max_prompt_length())
+      .enable_profile_kv_blocks(options_.enable_profile_kv_blocks())
+      .disable_ttft_profiling(options_.disable_ttft_profiling())
+      .max_global_ttft_ms(options_.max_global_ttft_ms())
+      .max_global_tpot_ms(options_.max_global_tpot_ms())
+      .server_idx(options_.server_idx())
+      .rec_worker_max_concurrency(options_.rec_worker_max_concurrency());
+  DisaggPDServiceOptions response_options;
+  if (options_.enable_disagg_pd()) {
+    response_options.enable_response_formatting = true;
+    response_options.tool_parser_format =
+        options_.tool_call_parser().value_or("");
+    response_options.reasoning_parser_format =
+        options_.reasoning_parser().value_or("");
+    response_options.system_fingerprint =
+        api_service::openai_system_fingerprint(options_, &model_args_);
+  }
+  auto create_scheduler =
+      [this, &scheduler_options, &response_options](auto* engine) {
+        scheduler_options
+            .enable_adaptive_draft_step(options_.enable_adaptive_draft_step())
+            .adaptive_target_verify_calibration(
+                options_.adaptive_target_verify_calibration())
+            .enable_adaptive_target_verify(
+                options_.enable_task_pipeline() &&
+                options_.enable_adaptive_target_verify() &&
+                SpeculativeConfig::supports_adaptive_target_verify(
+                    options_.speculative_algorithm()))
+            .adaptive_target_verify_cost_table(
+                options_.adaptive_target_verify_cost_table())
+            .adaptive_target_verify_cost_table_output(
+                options_.adaptive_target_verify_cost_table_output());
+        CHECK(options_.adaptive_target_verify_cost_table_output().empty() ||
+              scheduler_options.enable_adaptive_target_verify())
+            << "DSpark cost-table output requires an adaptive DSpark task "
+               "pipeline.";
+        if (scheduler_options.enable_adaptive_target_verify() ||
+            !options_.adaptive_target_verify_calibration().empty() ||
+            !options_.adaptive_target_verify_cost_table().empty()) {
+          scheduler_options.spec_calibration_compatibility(
+              spec_calibration_compatibility(engine->options()));
+        }
+        scheduler_ = create_continuous_scheduler(
+            engine,
+            scheduler_options,
+            distributed_worker_manager_,
+            llm_engine_ != nullptr ? model_residency_coordinator_ : nullptr,
+            kv_transfer_coordinator_,
+            std::move(response_options));
+      };
+  dispatch_engine(create_scheduler,
+                  llm_engine_.get(),
+                  suffix_engine_.get(),
+                  speculative_engine_.get());
+
+  if (options_.enable_service_routing()) {
+    auto& instance_info = scheduler_->get_instance_info();
+    XServiceClient::get_instance()->register_instance(instance_info);
+  }
+
+  auto initialize_tokenizer = [this](auto* engine) {
+    chat_template_ = ChatTemplateFactory::create(engine->tokenizer_args(),
+                                                 model_args_.model_type());
+    tokenizer_ = engine->tokenizer()->clone();
+  };
+  dispatch_engine(initialize_tokenizer,
+                  llm_engine_.get(),
+                  suffix_engine_.get(),
+                  speculative_engine_.get());
+  Tokenizer* request_tokenizer = tokenizer_.get();
+  threadpool_ = std::make_unique<ThreadPool>(
+      /*num_threads=*/options_.num_request_handling_threads(),
+      [request_tokenizer]() { request_tokenizer->warmup(); },
+      /*cpu_binding=*/false,
+      /*pool_name=*/"LLMMaster.request");
+
+  request_factory_ = std::make_unique<LLMRequestFactory>(
+      tokenizer_.get(),
+      chat_template_.get(),
+      &model_args_,
+      &options_,
+      get_rate_limiter(),
+      task_type_,
+      [this](const std::vector<RequestOutput>& outputs) {
+        return handle_rpc_responses(outputs);
+      });
+}
+
+LLMMaster::~LLMMaster() {
+  LOG(INFO) << "LLMMaster stopping...";
+
+  // Drain and join the request thread pool before any of the members its
+  // worker lambdas touch are destroyed. Those lambdas dereference
+  // request_factory_ (as well as scheduler_ and the rate limiter), but
+  // request_factory_ is declared after threadpool_ in the header, so member
+  // destruction would otherwise free the factory while pool workers are still
+  // in flight. ~ThreadPool only signals/joins its workers when the pool is
+  // destroyed, so reset it here explicitly while all dependencies are alive.
+  // Done before joining loop_thread_ so the scheduler keeps advancing while the
+  // pool drains.
+  threadpool_.reset();
+  // Stop accepting work after request handlers have finished admission. The
+  // loop still drains prefetch callbacks before scheduler/engine destruction.
+  stoped_.store(true, std::memory_order_release);
+
+  // wait for the loop thread to finish
+  if (loop_thread_.joinable()) {
+    loop_thread_.join();
+  }
+}
+
+void LLMMaster::count_chat_tokens(
+    std::vector<Message> messages,
+    RequestParams params,
+    std::function<void(Status, int32_t)> callback) {
+  threadpool_->schedule([this,
+                         messages = std::move(messages),
+                         params = std::move(params),
+                         callback = std::move(callback)]() {
+    xllm::ScopeGuard rate_limit_guard(
+        [this] { get_rate_limiter()->decrease_one_request(); });
+    std::optional<std::string> prompt = chat_template_->apply(
+        messages, params.tools, params.chat_template_kwargs);
+    if (!prompt.has_value()) {
+      callback(Status(StatusCode::INVALID_ARGUMENT,
+                      "Failed to construct prompt from messages"),
+               0);
+      return;
+    }
+    std::vector<int32_t> tokens;
+    if (!tokenizer_->encode(
+            prompt.value(), &tokens, params.add_special_tokens)) {
+      callback(Status(StatusCode::INVALID_ARGUMENT, "Failed to encode prompt"),
+               0);
+      return;
+    }
+    callback(Status(), static_cast<int32_t>(tokens.size()));
+  });
+}
+
+template <typename Input>
+void LLMMaster::schedule_batch_request(std::vector<Input> inputs,
+                                       std::vector<RequestParams> params,
+                                       BatchOutputCallback callback) {
+  CHECK(inputs.size() == params.size() || params.size() == 1)
+      << "Number of inputs and sampling parameters should be the same";
+  const size_t num_requests = inputs.size();
+  if (num_requests == 0) {
+    return;
+  }
+  CHECK_GT(threadpool_->size(), 0)
+      << "Request handling requires at least one worker";
+  if (num_requests == 1 || !tokenizer_->parallel_batch_encode_enabled()) {
+    for (size_t i = 0; i < num_requests; ++i) {
+      handle_request(std::move(inputs[i]),
+                     std::nullopt,
+                     params.size() == 1 ? params[0] : std::move(params[i]),
+                     std::nullopt,
+                     [i, callback](RequestOutput output) {
+                       output.log_request_status();
+                       return callback(i, std::move(output));
+                     });
+    }
+    return;
+  }
+
+  scheduler_->incr_pending_requests(num_requests);
+  const auto arrival_time = std::chrono::steady_clock::now();
+  threadpool_->schedule([this,
+                         inputs = std::move(inputs),
+                         params = std::move(params),
+                         callback = std::move(callback),
+                         num_requests,
+                         arrival_time]() mutable {
+    AutoCounter handling_latency(
+        std::is_same_v<Input, std::string>
+            ? COUNTER_request_handling_latency_seconds_completion
+            : COUNTER_request_handling_latency_seconds_chat);
+    SCOPE_GUARD([this, num_requests] {
+      for (size_t i = 0; i < num_requests; ++i) {
+        scheduler_->decr_pending_requests();
+      }
+    });
+    auto requests = request_factory_->create_batch(
+        std::move(inputs), params, callback, arrival_time);
+    for (size_t i = 0; i < requests.size(); ++i) {
+      if (requests[i] == nullptr) {
+        continue;
+      }
+      if (!scheduler_->add_request(requests[i])) {
+        const RequestParams& sp = params[params.size() == 1 ? 0 : i];
+        RequestOutput output{
+            Status{StatusCode::RESOURCE_EXHAUSTED,
+                   "No available resources to schedule request"},
+            sp.service_request_id,
+            sp.source_xservice_addr};
+        output.log_request_status();
+        callback(i, output);
+      }
+    }
+  });
+}
+
+void LLMMaster::handle_batch_request(std::vector<std::string> prompts,
+                                     std::vector<RequestParams> sps,
+                                     BatchOutputCallback callback) {
+  schedule_batch_request(
+      std::move(prompts), std::move(sps), std::move(callback));
+}
+
+void LLMMaster::handle_batch_request(
+    std::vector<std::vector<Message>> conversations,
+    std::vector<RequestParams> sps,
+    BatchOutputCallback callback) {
+  schedule_batch_request(
+      std::move(conversations), std::move(sps), std::move(callback));
+}
+
+void LLMMaster::handle_request(std::string prompt,
+                               std::optional<std::vector<int>> prompt_tokens,
+                               RequestParams sp,
+                               std::optional<Call*> call,
+                               OutputCallback callback) {
+  const auto arrival_time = std::chrono::steady_clock::now();
+  scheduler_->incr_pending_requests(1);
+  // add into the queue
+  threadpool_->schedule([this,
+                         prompt = std::move(prompt),
+                         prompt_token = std::move(prompt_tokens),
+                         sp = std::move(sp),
+                         callback = std::move(callback),
+                         arrival_time,
+                         call]() mutable {
+    AUTO_COUNTER(request_handling_latency_seconds_completion);
+
+    // remove the pending request after scheduling
+    SCOPE_GUARD([this] { scheduler_->decr_pending_requests(); });
+
+    // Guard the rate-limit slot acquired at the service entry. If we bail
+    // before the factory has a chance to create the Request, this
+    // releases the slot; otherwise Request itself takes ownership.
+    xllm::ScopeGuard rate_limit_guard(
+        [this] { get_rate_limiter()->decrease_one_request(); });
+
+    Timer timer;
+    // verify the prompt
+    if (!sp.verify_params(callback)) {
+      return;
+    }
+
+    rate_limit_guard.dismiss();
+    auto request = request_factory_->create(std::move(prompt),
+                                            std::move(prompt_token),
+                                            sp,
+                                            call,
+                                            callback,
+                                            /*generation_mode=*/std::nullopt,
+                                            arrival_time);
+    if (!request) {
+      return;
+    }
+
+    if (!scheduler_->add_request(request)) {
+      CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
+                          "No available resources to schedule request",
+                          sp.service_request_id,
+                          sp.source_xservice_addr);
+    }
+  });
+}
+
+void LLMMaster::handle_request(std::vector<Message> messages,
+                               std::optional<std::vector<int>> prompt_tokens,
+                               RequestParams sp,
+                               std::optional<Call*> call,
+                               OutputCallback callback) {
+  const auto arrival_time = std::chrono::steady_clock::now();
+  scheduler_->incr_pending_requests(1);
+  // add into the queue
+  threadpool_->schedule([this,
+                         messages = std::move(messages),
+                         prompt_token = std::move(prompt_tokens),
+                         sp = std::move(sp),
+                         callback = std::move(callback),
+                         arrival_time,
+                         call]() mutable {
+    AUTO_COUNTER(request_handling_latency_seconds_chat);
+
+    // remove the pending request after scheduling
+    SCOPE_GUARD([this] { scheduler_->decr_pending_requests(); });
+
+    // Guard the rate-limit slot acquired at the service entry.
+    xllm::ScopeGuard rate_limit_guard(
+        [this] { get_rate_limiter()->decrease_one_request(); });
+
+    // verify the prompt
+    if (!sp.verify_params(callback)) {
+      return;
+    }
+
+    rate_limit_guard.dismiss();
+    auto request = request_factory_->create(
+        messages, std::move(prompt_token), sp, call, callback, arrival_time);
+    if (!request) {
+      return;
+    }
+
+    if (!scheduler_->add_request(request)) {
+      CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
+                          "No available resources to schedule request",
+                          sp.service_request_id,
+                          sp.source_xservice_addr);
+    }
+  });
+}
+
+void LLMMaster::run() {
+  if (!is_leader()) {
+    Master::run();
+    return;
+  }
+
+  const bool already_running = running_.load(std::memory_order_relaxed);
+  if (already_running) {
+    LOG(WARNING) << "LLMMaster is already running.";
+    return;
+  }
+
+  running_.store(true, std::memory_order_relaxed);
+  loop_thread_ = std::thread([this]() {
+    const auto timeout = absl::Milliseconds(500);
+    while (!stoped_.load(std::memory_order_acquire) ||
+           scheduler_->has_pending_prefetch()) {
+      scheduler_->step(timeout);
+    }
+    running_.store(false, std::memory_order_relaxed);
+  });
+}
+
+void LLMMaster::generate() {
+  DCHECK(options_.enable_schedule_overlap())
+      << "Mode generate does not support schedule overlap yet.";
+  const bool already_running = running_.load(std::memory_order_relaxed);
+  if (already_running) {
+    LOG(WARNING) << "Generate is already running.";
+    return;
+  }
+
+  running_.store(true, std::memory_order_relaxed);
+  scheduler_->generate();
+  running_.store(false, std::memory_order_relaxed);
+}
+
+bool LLMMaster::handle_rpc_response(const RequestOutput& output) {
+  // response to xllm service to avoid the redirect cost.
+  if (xservice_client_ == nullptr) return false;
+  auto return_status = xservice_client_->generations({output});
+  CHECK_EQ(return_status.size(), 1)
+      << "return size of generations is not equal to 1";
+  return return_status[0];
+}
+
+std::vector<bool> LLMMaster::handle_rpc_responses(
+    const std::vector<RequestOutput>& outputs) {
+  // response to xllm service to avoid the redirect cost.
+  if (xservice_client_ == nullptr)
+    return std::vector<bool>(outputs.size(), false);
+  return xservice_client_->generations(outputs);
+}
+
+bool LLMMaster::sleep() {
+  if (llm_engine_ == nullptr) {
+    LOG(ERROR) << "Sleep is not supported for speculative engines.";
+    return false;
+  }
+  return model_residency_coordinator_->sleep(master_status_);
+}
+
+bool LLMMaster::requires_wakeup() const {
+  return model_residency_coordinator_ != nullptr &&
+         model_residency_coordinator_->is_suspended();
+}
+
+bool LLMMaster::wakeup() {
+  WakeupOptions options;
+  return wakeup(options);
+}
+
+bool LLMMaster::wakeup(const WakeupOptions& options) {
+  if (llm_engine_ == nullptr) {
+    LOG(ERROR) << "Wakeup is not supported for speculative engines.";
+    return false;
+  }
+  WakeupOptions opts = options;
+  opts.master_status = master_status_;
+  return model_residency_coordinator_->wakeup(opts);
+}
+
+bool LLMMaster::link_p2p(const std::vector<std::string>& remote_addrs) {
+  return distributed_worker_manager_->link_p2p(remote_addrs);
+}
+
+bool LLMMaster::unlink_p2p(const std::vector<std::string>& remote_addrs) {
+  return distributed_worker_manager_->unlink_p2p(remote_addrs);
+}
+
+bool LLMMaster::start_profile() {
+  return dispatch_engine([](auto* engine) { return engine->start_profile(); },
+                         llm_engine_.get(),
+                         suffix_engine_.get(),
+                         speculative_engine_.get());
+}
+
+bool LLMMaster::stop_profile() {
+  return dispatch_engine([](auto* engine) { return engine->stop_profile(); },
+                         llm_engine_.get(),
+                         suffix_engine_.get(),
+                         speculative_engine_.get());
+}
+
+}  // namespace xllm

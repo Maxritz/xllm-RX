@@ -1,0 +1,75 @@
+include(cc_library)
+include(cc_binary)
+
+add_subdirectory(profile)
+
+cc_library(
+  NAME
+    scheduler
+  HDRS
+    scheduler_policy.h
+    zero_eviction_scheduler.h
+    continuous_scheduler.h
+    disagg_pd_scheduler.h
+    request_output_dispatcher.h
+    scheduler.h
+    dit_scheduler.h
+    scheduler_factory.h
+    request_priority_queue.h
+    fixed_steps_scheduler.h
+    scheduler_metrics.h
+    scheduler_notifier.h
+    kv_cache_prefetcher.h
+  SRCS
+    scheduler_policy.cpp
+    prefill_first_policy.cpp
+    decode_first_policy.cpp
+    unified_policy.cpp
+    zero_eviction_scheduler.cpp
+    continuous_scheduler.cpp
+    scheduler_metrics.cpp
+    disagg_pd_scheduler.cpp
+    request_output_dispatcher.cpp
+    dit_scheduler.cpp
+    scheduler_factory.cpp
+    fixed_steps_scheduler.cpp
+    kv_cache_prefetcher.cpp
+  DEPS
+    :batch
+    :distributed_runtime
+    :distributed_virtual_memory_coordinator
+    :request
+    :runtime
+    :profile
+    :pd_topology_guard
+    glog::glog
+    Folly::folly
+    absl::time
+    absl::synchronization
+)
+
+# Request-path hop 3: add_request, prepare_batch, process_batch_output.
+cc_binary(
+  NAME
+    continuous_scheduler_benchmark
+  SRCS
+    continuous_scheduler_benchmark.cpp
+  DEPS
+    :config
+    :scheduler
+    :xllm_server
+    :block
+    torch
+    benchmark::benchmark
+    benchmark::benchmark_main
+    $<$<BOOL:${USE_NPU}>:nnopbase>
+)
+target_link_libraries(continuous_scheduler_benchmark
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>)
+target_link_options(continuous_scheduler_benchmark
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)

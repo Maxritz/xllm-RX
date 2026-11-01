@@ -1,0 +1,26 @@
+include(cc_library)
+
+cc_library(
+  NAME 
+    sampler
+  HDRS
+    sampling_params.h
+    logits_processor.h
+    sampler.h
+    rec_sampler.h
+    beam_searcher.h
+  SRCS
+    sampling_params.cpp
+    logits_processor.cpp
+    sampler.cpp
+    rec_sampler.cpp
+    beam_searcher.cpp
+  DEPS
+    util
+    :common
+    glog::glog
+    torch
+    :kernels
+    $<$<BOOL:${USE_NPU}>:xllm_ops>
+    $<$<BOOL:${USE_NPU}>:tilelang_kernels>
+)

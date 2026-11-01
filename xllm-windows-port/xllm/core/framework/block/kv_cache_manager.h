@@ -1,0 +1,150 @@
+/* Copyright 2025-2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <functional>
+#include <utility>
+#include <vector>
+
+#include "common/macros.h"
+#include "framework/batch/batch_group.h"
+#include "framework/batch/rec_batch_group.h"
+#include "framework/model/model_params_view.h"
+#include "framework/request/request.h"
+#include "framework/request/sequence.h"
+
+namespace xllm {
+
+struct HostCacheRestorePoint {
+  size_t restore_target_tokens = 0;
+  size_t copy_units = 0;
+};
+
+class KVCacheManager {
+ public:
+  using KVCacheReservation = std::pair<Sequence*, size_t>;
+
+  using PrefetchDoneCallback = std::function<void(std::shared_ptr<Request>)>;
+  using PrefetchCompletionCallback = std::function<void()>;
+
+  virtual ~KVCacheManager() = default;
+
+  virtual bool allocate(Sequence* sequence) = 0;
+  virtual bool allocate(std::vector<Sequence*>& sequences) = 0;
+  virtual bool allocate(Sequence* sequence, size_t num_tokens) = 0;
+  // Return true only when the requested token footprint cannot fit even if
+  // every block in the selected pool were available. Unknown layouts return
+  // false so callers can preserve the request for a later allocation retry.
+  virtual bool exceeds_total_capacity(Sequence* sequence,
+                                      size_t num_tokens) const {
+    return false;
+  }
+  virtual bool exceeds_total_capacity(
+      const std::vector<KVCacheReservation>& reservations) const {
+    for (const auto& [sequence, num_tokens] : reservations) {
+      if (exceeds_total_capacity(sequence, num_tokens)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  virtual bool try_allocate(Sequence* sequence) = 0;
+
+  virtual void transfer_blocks(BatchGroup& batches) {};
+  virtual void transfer_blocks(RecBatchGroup& batches) {};
+  virtual void transfer_blocks() {};
+
+  // Managers without storage prefetch admit directly to the ready queue.
+  virtual bool has_storage_prefetch() const { return false; }
+
+  virtual void prefetch_from_storage(std::shared_ptr<Request> request,
+                                     PrefetchDoneCallback done) {
+    done(std::move(request));
+  }
+
+  // Notify the scheduler when an asynchronous prefetch completion is ready
+  // to be drained on the scheduler thread.
+  virtual void set_prefetch_completion_callback(
+      PrefetchCompletionCallback callback) {}
+
+  // Apply completed prefetches on the scheduler thread before cache admission.
+  virtual void drain_prefetch_completions() {}
+
+  virtual std::vector<Block> allocate(size_t num_tokens, int32_t& dp_rank) = 0;
+  virtual void deallocate(Request* request) = 0;
+  virtual void deallocate(std::vector<Sequence*>& sequences) = 0;
+  virtual void deallocate(Sequence* sequence) = 0;
+
+  virtual void allocate_shared(Sequence* sequence) = 0;
+  // Whether shared matching is needed before sizing the next prefill chunk.
+  virtual bool needs_shared_reprobe(Sequence* sequence) const {
+    return sequence->kv_state().num_blocks(BlockType::KV) == 0;
+  }
+  virtual bool supports_host_cache_restore() const { return false; }
+  virtual bool has_pending_async_block_release() const { return false; }
+  virtual HostCacheRestorePoint select_host_cache_restore(
+      Sequence* sequence,
+      size_t /*max_copy_units*/) {
+    return HostCacheRestorePoint{
+        /*restore_target_tokens=*/sequence->kv_state().kv_cache_tokens_num(),
+        /*copy_units=*/0};
+  }
+  virtual void trim_host_cache(Sequence* sequence,
+                               const HostCacheRestorePoint& selected_restore) {
+    sequence->set_host_cache_restore(selected_restore.restore_target_tokens,
+                                     selected_restore.copy_units);
+  }
+  virtual void cache(Sequence* sequence) = 0;
+  // Cache only the full blocks covered by the first `num_tokens` tokens. Used
+  // by in-batch prefix cache to publish admitted prefill blocks before they are
+  // deallocated, so later requests in the same batch can share them.
+  virtual void cache(Sequence* sequence, size_t num_tokens) = 0;
+
+  virtual std::vector<std::vector<BlockTransferInfo>>*
+  get_swap_block_transfer_infos() = 0;
+
+  virtual uint32_t num_blocks() const = 0;
+  // Advisory total capacity, including held blocks. Elastic caches may return
+  // a stale physical-budget snapshot; a low value alone cannot prove that an
+  // otherwise idle request will fail allocation. num_blocks() is the configured
+  // limit, while allocate() validates the current backing capacity.
+  virtual size_t admission_capacity(int32_t /*dp_rank*/) const {
+    return num_blocks();
+  }
+  virtual int32_t block_size() const = 0;
+  virtual std::vector<size_t> num_blocks_in_prefix_cache() const = 0;
+  virtual std::vector<size_t> num_free_blocks() const = 0;
+  virtual std::vector<size_t> num_used_blocks() const = 0;
+  virtual double kv_cache_utilization() const = 0;
+
+  // Predict which DP rank a fresh sequence would be assigned to during
+  // allocation. Uses the same effective-headroom metric and round-robin
+  // tie-break as the real allocation path so callers can perform accurate
+  // per-rank admission checks before allocation happens.
+  // Returns 0 for single-rank or non-pool managers.
+  virtual int32_t select_dp_rank() const { return 0; }
+
+  // Reserve VirtualMemory padding blocks after KV tensors are created.
+  virtual void reserve_virtual_memory_padding_blocks() {}
+
+ protected:
+  KVCacheManager() = default;
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(KVCacheManager);
+};
+
+}  // namespace xllm
