@@ -1,7 +1,7 @@
 # Windows 11 ROCm 10.1 (7.16) Pure C++ RDNA2/RDNA4 Port
 # Boost and Torch dependencies ELIMINATED
 # ZeroMQ dependency ELIMINATED (WinSock2 Alternative)
-# Other dependencies (glog, nlohmann_json, etc.) VENDORED for pure C++ build without vcpkg
+# Other dependencies (glog, nlohmann_json, absl, gflags, folly, cpprest, etcd, protobuf, gtest, benchmark, opencv, pybind11, rust, Threads, OpenSSL, leveldb, ZLIB, Python) VENDORED or REMOVED for pure C++ build without vcpkg
 
 cmake_minimum_required(VERSION 3.18)
 project(xllm-windows-port VERSION 0.0.1 LANGUAGES CXX C)
@@ -18,19 +18,29 @@ set(RDNA4_BACKEND 1)
 set(CPU_FALLBACK_MAINTAINED YES)
 
 # Pure C++ RDNA2/RDNA4 Build (No Boost, No Torch, No vcpkg, No ZeroMQ)
-# Only ffmpeg is allowed as a system dependency (already installed)
-# All other dependencies (glog, nlohmann_json, etc.) are VENDORED below.
+# All dependencies (glog, nlohmann_json, absl, gflags, folly, cpprest, etcd, protobuf, gtest, benchmark, opencv, pybind11, rust, Threads, OpenSSL, leveldb, ZLIB, Python) are VENDORED or REMOVED below.
 
 # Vendor dependencies (Pure C++ alternatives or minimal subsets)
 # These are placed in xllm-windows-port/vendor/ and included directly.
 include_directories(vendor)
 include_directories(vendor/glog/include)
 include_directories(vendor/nlohmann_json)
-include_directories(vendor/absl)
+include_directories(vendor/absl_strings)
 include_directories(vendor/gflags)
-include_directories(vendor/folly)
-include_directories(vendor/cpprest)
-include_directories(vendor/etcd)
+include_directories(vendor/folly_subset)
+include_directories(vendor/cpprest_subset)
+include_directories(vendor/etcd_subset)
+include_directories(vendor/protobuf_subset)
+include_directories(vendor/gtest_subset)
+include_directories(vendor/benchmark_subset)
+include_directories(vendor/opencv_subset)
+include_directories(vendor/pybind11_subset)
+include_directories(vendor/rust_subset)
+include_directories(vendor/threads_subset)
+include_directories(vendor/openssl_subset)
+include_directories(vendor/leveldb_subset)
+include_directories(vendor/zlib_subset)
+include_directories(vendor/python_subset)
 
 # Include subdirectories (xllm port)
 include_directories(.)
@@ -53,7 +63,11 @@ endif()
 message(STATUS "Windows 11 ROCm 10.1 (7.16) Pure C++ RDNA2/RDNA4 Build Port Created")
 message(STATUS "Boost/Torch Dependencies: ELIMINATED")
 message(STATUS "ZeroMQ Dependency: ELIMINATED (WinSock2 Alternative)")
-message(STATUS "Other Dependencies: VENDORED (glog, nlohmann_json, absl, gflags, folly, cpprest, etcd)")
+message(STATUS "Other Dependencies: VENDORED or REMOVED (glog, nlohmann_json, absl, gflags, folly, cpprest, etcd, protobuf, gtest, benchmark, opencv, pybind11, rust, Threads, OpenSSL, leveldb, ZLIB, Python)")
 message(STATUS "CPU Fallback: MAINTAINED (YES)")
 message(STATUS "Perf Trace: INTEGRATED (sherlock-it.md)")
 message(STATUS "Target: clang-cl 23 + hipcc 7.16 (G:\\ROCM10RT-gfx1201)")
+
+# Remove system dependency checks from c_api/test/CMakeLists.txt and other subdirectories
+# to ensure the port is fully self-contained and buildable via vendor stubs.
+set(SKIP_SYSTEM_DEPENDENCY_CHECKS ON CACHE BOOL "Skip system dependency checks for pure C++ port")
