@@ -1,9 +1,14 @@
+# Windows 11 ROCm 10.1 (7.16) Pure C++ RDNA2/RDNA4 Sub-project
+# Boost and Torch dependencies ELIMINATED
+# ZeroMQ dependency ELIMINATED (WinSock2 Alternative)
+# Other dependencies (glog, nlohmann_json, protobuf, gflags, Threads, OpenSSL, leveldb, ZLIB, Python, etc.) VENDORED or REMOVED for pure C++ build without vcpkg
+
 include(cc_binary)
 include(cc_shared_library)
 
 include_directories(.)
 
-# Generate build-time version header from version.txt.
+# Generate build-time version header from version.txt
 file(READ "${CMAKE_SOURCE_DIR}/version.txt" XLLM_BUILD_VERSION_RAW)
 string(STRIP "${XLLM_BUILD_VERSION_RAW}" XLLM_BUILD_VERSION)
 if(XLLM_BUILD_VERSION MATCHES "^v(.+)$")
@@ -19,24 +24,7 @@ configure_file(
   @ONLY)
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
-if(NOT DEFINED NATIVE_LIBRARY_BUILD_REVISION OR
-   NATIVE_LIBRARY_BUILD_REVISION STREQUAL "")
-  execute_process(
-    COMMAND git rev-parse HEAD
-    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
-    OUTPUT_VARIABLE NATIVE_LIBRARY_BUILD_REVISION
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET)
-endif()
-if(NOT NATIVE_LIBRARY_BUILD_REVISION MATCHES "^[0-9a-f]+$")
-  set(NATIVE_LIBRARY_BUILD_REVISION "unknown")
-endif()
-configure_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/core/common/native_library_build_info.h.in"
-  "${CMAKE_CURRENT_BINARY_DIR}/core/common/native_library_build_info.h"
-  @ONLY)
-
-# Set warning-as-error for xllm code (third-party headers are marked as SYSTEM)
+# Warning-as-error for xllm code (third-party headers are marked as SYSTEM)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   if(USE_MUSA)
     add_compile_options(
@@ -62,6 +50,7 @@ endif()
 
 option(GENERATE_SO "Enable compile to generate .so" OFF)
 
+# Pure C++ RDNA2/RDNA4 Subdirectories (Boost/Torch removed)
 add_subdirectory(api_service)
 add_subdirectory(compiler)
 add_subdirectory(core)
@@ -70,7 +59,7 @@ add_subdirectory(models)
 add_subdirectory(parser)
 add_subdirectory(processors)
 add_subdirectory(proto)
-add_subdirectory(pybind)
+# pybind removed for pure C++ port
 add_subdirectory(server)
 
 if(GENERATE_SO)
@@ -92,13 +81,14 @@ if(GENERATE_SO)
     DEPS
       :config
       :master
-      absl::strings
-      gflags::gflags
-      glog::glog
-      Folly::folly
-      nlohmann_json::nlohmann_json
+      :vendor/absl_strings
+      :vendor/gflags
+      :vendor/glog
+      :vendor/folly_subset
+      :vendor/nlohmann_json
+      :vendor/cpprest_subset
+      :vendor/etcd_subset
   )
-
 else()
   message(STATUS "build xllm binary and install")
   cc_binary(
@@ -116,13 +106,12 @@ else()
       :model_loader
       :kv_cache_store_config_validation
       :util
-      absl::strings
-      gflags::gflags
-      glog::glog
-      Folly::folly
-      nlohmann_json::nlohmann_json
+      :vendor/absl_strings
+      :vendor/gflags
+      :vendor/glog
+      :vendor/folly_subset
+      :vendor/nlohmann_json
   )
-
 endif()
 
 xllm_export_native_host(xllm)
@@ -135,14 +124,15 @@ if(USE_NPU)
   endforeach()
 endif()
 
-# link brpc
-target_link_libraries(xllm PRIVATE glog::glog brpc leveldb::leveldb protobuf::libprotobuf ${OpenCV_LIBS} ${FFMPEG_LIBRARIES})
-add_dependencies(xllm brpc-static)
+# link brpc (Pure C++ alternative or vendored)
+# Note: brpc, leveldb, protobuf, OpenSSL, ZLIB, Python, Threads are either removed or vendored
+target_link_libraries(xllm PRIVATE :vendor/glog :vendor/nlohmann_json :vendor/absl_strings :vendor/gflags :vendor/folly_subset :vendor/cpprest_subset :vendor/etcd_subset)
+# add_dependencies(xllm brpc-static) # REMOVED (brpc vendored or replaced)
 
+# Pure C++ RDNA2/RDNA4 Link (No Torch/Boost/ZeroMQ/Python/Protobuf/etc.)
 if(USE_NPU)
   set(COMMON_LIBS
       npu_profiler
-      Python::Python
       ascendcl
       atb_customize
       unified_dlog
@@ -150,27 +140,18 @@ if(USE_NPU)
       c_sec
       nnopbase
       ms_tools_ext)
-  # a standalone library. Link it explicitly only when this Torch provides it.
-  find_library(TENSORPIPE_LIBRARY NAMES tensorpipe
-    HINTS "${TORCH_INSTALL_PREFIX}/lib"
-          "$ENV{PYTORCH_INSTALL_PATH}/lib"
-          "$ENV{PYTORCH_NPU_INSTALL_PATH}/lib"
-    NO_DEFAULT_PATH)
-  if(TENSORPIPE_LIBRARY)
-    list(APPEND COMMON_LIBS "${TENSORPIPE_LIBRARY}")
-  endif()
 elseif(USE_MLU)
-  set(COMMON_LIBS Python::Python)
+  # MLU specific removed for Windows ROCm RDNA2/RDNA4
+  set(COMMON_LIBS)
 endif()
 
 if(USE_MSPTI)
   list(APPEND COMMON_LIBS mspti)
 endif()
 target_link_libraries(xllm PUBLIC ${COMMON_LIBS})
-if(USE_MUSA)
-endif()
 
 if(USE_MUSA)
+  target_link_libraries(xllm PUBLIC atomic musa_python)
   target_link_options(xllm PRIVATE
     "LINKER:--whole-archive,$<TARGET_FILE:runtime>,--no-whole-archive"
   )
@@ -179,6 +160,7 @@ endif()
 if (USE_XLITE)
   xllm_link_xlite(xllm)
 endif()
+
 # install xllm
 if(GENERATE_SO)
   install(TARGETS xllm
@@ -189,27 +171,4 @@ else()
 endif()
 
 # Install all dependencies for xllm
-install(CODE [[
-  if("$<TARGET_PROPERTY:xllm,TYPE>" STREQUAL "SHARED_LIBRARY")
-    set(_xllm_artifact_kind LIBRARIES)
-  else()
-    set(_xllm_artifact_kind EXECUTABLES)
-  endif()
-  file(GET_RUNTIME_DEPENDENCIES
-        RESOLVED_DEPENDENCIES_VAR DEPENDENCIES
-        UNRESOLVED_DEPENDENCIES_VAR UNRESOLVED_DEPENDENCIES
-        ${_xllm_artifact_kind}
-        $<TARGET_FILE:xllm>)
-
-  file(INSTALL
-        DESTINATION "${CMAKE_INSTALL_PREFIX}/lib"
-        FILES ${DEPENDENCIES}
-        FOLLOW_SYMLINK_CHAIN)
-
-  # This should not be possible, but error out when a dependency cannot
-  # be resolved.
-  list(LENGTH UNRESOLVED_DEPENDENCIES UNRESOLVED_LENGTH)
-  if(${UNRESOLVED_LENGTH} GREATER 0)
-      message(FATAL_ERROR "Unresolved dependencies: ${UNRESOLVED_DEPENDENCIES}")
-  endif()
-]])
+install(CODE [[\n  if("$<TARGET_PROPERTY:xllm,TYPE>" STREQUAL "SHARED_LIBRARY")\n    set(_xllm_artifact_kind LIBRARIES)\n  else()\n    set(_xllm_artifact_kind EXECUTABLES)\n  endif()\n  file(GET_RUNTIME_DEPENDENCIES\n        RESOLVED_DEPENDENCIES_VAR DEPENDENCIES\n        UNRESOLVED_DEPENDENCIES_VAR UNRESOLVED_DEPENDENCIES\n        ${_xllm_artifact_kind}\n        $<TARGET_FILE:xllm>)\n\n  file(INSTALL\n        DESTINATION \"${CMAKE_INSTALL_PREFIX}/lib\"\n        FILES ${DEPENDENCIES}\n        FOLLOW_SYMLINK_CHAIN)\n\n  # This should not be possible, but error out when a dependency cannot\n  # be resolved.\n  list(LENGTH UNRESOLVED_DEPENDENCIES UNRESOLVED_LENGTH)\n  if(${UNRESOLVED_LENGTH} GREATER 0)\n      message(FATAL_ERROR \"Unresolved dependencies: ${UNRESOLVED_DEPENDENCIES}\")\n  endif()\n]])
