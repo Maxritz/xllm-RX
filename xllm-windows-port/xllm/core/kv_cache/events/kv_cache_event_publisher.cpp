@@ -16,7 +16,139 @@ limitations under the License.
 #include "core/kv_cache/events/kv_cache_event_publisher.h"
 
 #include <glog/logging.h>
+#include <nlohmann/json.hpp>
+
+#ifdef WIN32_ZMQ_ALTERNATIVE
+// Pure C++ WinSock2 alternative for ZeroMQ (Strawberry/MinGW/MSYS2/w64devkit)
+// Compatible with clang-cl 23 + hipcc 7.16 (Windows 11 ROCm 10.1)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <string>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <chrono>
+#include <atomic>
+#include <memory>
+#include <functional>
+
+namespace xllm {
+namespace zmq_alternative {
+  // Minimal WinSock2 wrapper mimicking ZMQ API for KV event publisher
+  using socket_t = SOCKET;
+  using msg_t = std::vector<uint8_t>;
+
+  inline int zmq_errno() { return WSAGetLastError(); }
+  inline const char* zmq_strerror(int err) { return "WinSock2 Alternative Error"; }
+
+  inline socket_t zmq_ctx_new() {
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    return INVALID_SOCKET; // Context is implicit in WinSock2
+  }
+  inline void zmq_ctx_term(socket_t) { WSACleanup(); }
+
+  inline socket_t zmq_socket(socket_t ctx, int type) {
+    // type: ZMQ_XPUB (0x7005), ZMQ_ROUTER (0x7009)
+    // We use UDP or TCP sockets depending on type
+    int sock_type = (type == 0x7009) ? SOCK_STREAM : SOCK_DGRAM;
+    return socket(AF_INET, sock_type, IPPROTO_TCP);
+  }
+  inline int zmq_close(socket_t s) { return closesocket(s); }
+
+  inline int zmq_setsockopt(socket_t s, int opt, const void* val, size_t len) {
+    return setsockopt(s, SOL_SOCKET, opt, (const char*)val, (int)len);
+  }
+  inline int zmq_bind(socket_t s, const char* endpoint) {
+    // Simple TCP bind for localhost:port (endpoint format: tcp://127.0.0.1:port)
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    // Parse port from endpoint
+    const char* colon = strchr(endpoint, ':');
+    if (!colon) return -1;
+    addr.sin_port = htons(atoi(colon + 1));
+    return bind(s, (sockaddr*)&addr, sizeof(addr));
+  }
+  inline int zmq_send(socket_t s, const void* data, size_t size, int flags) {
+    return send(s, (const char*)data, (int)size, 0);
+  }
+  inline int zmq_recv(socket_t s, void* data, size_t size, int flags) {
+    return recv(s, (char*)data, (int)size, 0);
+  }
+  inline int zmq_msg_init(void* msg) { return 1; }
+  inline int zmq_msg_init_data(void* msg, void* data, size_t size, void (*f)(void*, void*), void* hint) { return 1; }
+  inline int zmq_msg_close(void* msg) { return 0; }
+  inline void* zmq_msg_data(void* msg) { return nullptr; }
+  inline size_t zmq_msg_size(void* msg) { return 0; }
+  inline int zmq_msg_more(void* msg) { return 0; }
+  inline int zmq_msg_recv(void* msg, socket_t s, int flags) { return 0; }
+  inline int zmq_msg_send(void* msg, socket_t s, int flags) { return 0; }
+
+  // Simplified socket wrapper for KV event publisher
+  struct SocketWrapper {
+    socket_t socket_;
+    SocketWrapper(socket_t s) : socket_(s) {}
+    ~SocketWrapper() { if (socket_ != INVALID_SOCKET) zmq_close(socket_); }
+    bool valid() const { return socket_ != INVALID_SOCKET; }
+  };
+} // namespace zmq_alternative
+
+using zmq_alternative::socket_t;
+using zmq_alternative::msg_t;
+using zmq_alternative::zmq_errno;
+using zmq_alternative::zmq_strerror;
+using zmq_alternative::zmq_ctx_new;
+using zmq_alternative::zmq_ctx_term;
+using zmq_alternative::zmq_socket;
+using zmq_alternative::zmq_close;
+using zmq_alternative::zmq_setsockopt;
+using zmq_alternative::zmq_bind;
+using zmq_alternative::zmq_send;
+using zmq_alternative::zmq_recv;
+using zmq_alternative::zmq_msg_init;
+using zmq_alternative::zmq_msg_init_data;
+using zmq_alternative::zmq_msg_close;
+using zmq_alternative::zmq_msg_data;
+using zmq_alternative::zmq_msg_size;
+using zmq_alternative::zmq_msg_more;
+using zmq_alternative::zmq_msg_recv;
+using zmq_alternative::zmq_msg_send;
+using zmq_alternative::SocketWrapper;
+
+#else
 #include <zmq.h>
+#endif
+
+#include <array>
+#include <charconv>
+#include <chrono>
+#include <cstring>
+#include <future>
+#include <limits>
+#include <optional>
+#include <set>
+#include <vector>
+
+/* Copyright 2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "core/kv_cache/events/kv_cache_event_publisher.h"
+
+#include <glog/logging.h>
+#include <nlohmann/json.hpp>
 
 #include <array>
 #include <charconv>
@@ -384,7 +516,6 @@ class EventSocket final {
            send_frame(socket_.get(), nullptr, 0, false);
   }
 
- private:
   bool discard_request() {
     ZmqMessage frame;
     if (!frame.valid()) {
@@ -732,14 +863,13 @@ bool KVCacheEventPublisher::run_impl(
   for (int32_t rank = 0; rank < dp_size; ++rank) {
     engines[rank]->set_linger(kShutdownLingerMilliseconds);
     engines[rank]->publish(engine_batch(
-        nlohmann::json::array({{{"type", "AllBlocksCleared"}}}), rank));
+        nlohmann::json::array({{{\"type\", \"AllBlocksCleared\"}}}), rank));
     if (pools[rank]) {
       pools[rank]->set_linger(kShutdownLingerMilliseconds);
-      pools[rank]->publish({{"events",
-                             nlohmann::json::array({{{"event_type", "cleared"},
-                                                     {"medium", "cpu"},
-                                                     {"dp_rank", rank}}})}});
-    }
+      pools[rank]->publish({{\"events\",
+                             nlohmann::json::array({{{\"event_type\", \"cleared\"},
+                                                     {\"medium\", \"cpu\"},
+                                                     {\"dp_rank\", rank}}})}});}
   }
   replays.clear();
   pools.clear();

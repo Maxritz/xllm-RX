@@ -16,6 +16,14 @@ limitations under the License.
 #include "core/kv_cache/events/kv_cache_event_journal.h"
 
 #include <glog/logging.h>
+#include <nlohmann/json.hpp>
+
+#ifdef WIN32_ZMQ_ALTERNATIVE
+// Pure C++ WinSock2 alternative for ZeroMQ (Strawberry/MinGW/MSYS2/w64devkit)
+// Compatible with clang-cl 23 + hipcc 7.16 (Windows 11 ROCm 10.1)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 
 #include <algorithm>
 #include <random>

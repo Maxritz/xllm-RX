@@ -2,7 +2,9 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -10,6 +12,14 @@
 # limitations under the License.
 
 include(cc_library)
+
+# Alternative for ZeroMQ: Pure C++ WinSock2 (Strawberry/MinGW/MSYS2) implementation
+# Since ZeroMQ is not installed and we are building a pure C++ RDNA2/RDNA4 Windows 11 port
+# without vcpkg/Boost/Torch, we replace ZeroMQ with a lightweight WinSock2/MSYS2
+# TCP socket implementation for KV event publishing.
+
+# Define WIN32_ZMQ_ALTERNATIVE to enable the pure C++ socket alternative
+add_compile_definitions(WIN32_ZMQ_ALTERNATIVE)
 
 cc_library(
   NAME
@@ -24,16 +34,6 @@ cc_library(
     glog::glog
     nlohmann_json::nlohmann_json
     Threads::Threads
+    # WIN32_ZMQ_ALTERNATIVE replaces ZeroMQ dependency
+    # WIN32/Strawberry/MinGW/MSYS2 sockets used instead
 )
-if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
-  # Explicit development-library paths remain available for offline builds.
-  target_include_directories(kv_cache_events SYSTEM PRIVATE ${ZMQ_INCLUDE_DIR})
-  target_link_libraries(kv_cache_events PRIVATE ${ZMQ_LIBRARY})
-else()
-  find_package(ZeroMQ CONFIG REQUIRED)
-  if(TARGET libzmq-static)
-    target_link_libraries(kv_cache_events PRIVATE libzmq-static)
-  else()
-    target_link_libraries(kv_cache_events PRIVATE libzmq)
-  endif()
-endif()
